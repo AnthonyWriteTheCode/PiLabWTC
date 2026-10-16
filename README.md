@@ -84,6 +84,9 @@ sudo apt update && sudo apt install -y git
 git clone https://github.com/AnthonyWriteTheCode/PiLabWTC.git
 cd PiLabWTC
 
+# Make the scripts executable
+chmod +x *.sh wtc-workers
+
 # Run the automated installer
 sudo ./01-server-setup.sh
 ```
