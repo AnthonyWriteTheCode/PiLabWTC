@@ -1,4 +1,4 @@
-﻿# ⚡ WTC Pi RAM-Disk Web Server
+# ⚡ WTC Pi RAM-Disk Web Server
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%20%7C%20Ubuntu%20%7C%20Debian-orange.svg)](#prerequisites)
@@ -81,8 +81,8 @@ Connect via SSH (`ssh <user>@<pi-ip>` or `ssh <user>@wtc-pi.local`) and execute:
 sudo apt update && sudo apt install -y git
 
 # Clone this repository
-git clone https://github.com/your-username/wtc-piLab.git wtc-piLab
-cd wtc-piLab
+git clone https://github.com/AnthonyWriteTheCode/PiLabWTC.git
+cd PiLabWTC
 
 # Run the automated installer
 sudo ./01-server-setup.sh
@@ -203,7 +203,7 @@ The built-in `wtc-workers` daemon handles background tasks:
 To update your server scripts, management UI, and system services to the latest release without re-running initial setup:
 
 ```bash
-cd wtc-piLab
+cd PiLabWTC
 git pull
 sudo ./update.sh
 ```
