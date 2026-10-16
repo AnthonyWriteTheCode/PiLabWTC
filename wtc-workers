@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# /usr/local/bin/wtc-workers
+# WTC Background Worker Daemon & Supervisor for Laravel / Web Applications
+# Manages 'queue:work' and 'schedule:work' (plus custom .wtc-workers / Procfile)
+set -Eeuo pipefail
+
+LOG_FILE="/var/log/wtc-web/workers.log"
+PID_FILE="/run/wtc-workers.pid"
+CHILD_PIDS_FILE="/run/wtc-workers-children.pid"
+find_artisan_dir() {
+  if [ -f "/mnt/ramdisk/webroot/artisan" ]; then
+    echo "/mnt/ramdisk/webroot"
+  elif [ -f "/mnt/ramdisk/webroot/../artisan" ]; then
+    (cd /mnt/ramdisk/webroot/.. && pwd)
+  elif [ -f "/mnt/ramdisk/www/artisan" ]; then
+    echo "/mnt/ramdisk/www"
+  else
+    echo ""
+  fi
+}
+
+WWW_ROOT="/mnt/ramdisk/webroot"
+RUN_USER="www-data"
+
+mkdir -p /var/log/wtc-web /run
+
+log() {
+  local msg
+  msg="$(date '+%Y-%m-%d %H:%M:%S') [wtc-workers] $*"
+  echo "$msg" >> "$LOG_FILE"
+  echo "$msg"
+}
+
+# Graceful termination handler
+CHILD_PIDS=()
+CLEANING_UP=0
+cleanup() {
+  CLEANING_UP=1
+  log "Shutting down background workers..."
+  local a_dir; a_dir="$(find_artisan_dir)"
+  if [ -n "$a_dir" ] && [ -f "$a_dir/artisan" ]; then
+    su -s /bin/bash "$RUN_USER" -c "php '$a_dir/artisan' queue:restart" >> "$LOG_FILE" 2>&1 || true
+  fi
+  for pid in "${CHILD_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 1
+  for pid in "${CHILD_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+  CHILD_PIDS=()
+  rm -f "$PID_FILE" "$CHILD_PIDS_FILE"
+  log "All background workers stopped."
+  exit 0
+}
+
+trap cleanup SIGTERM SIGINT SIGHUP
+
+# Run supervisor daemon
+cmd_run() {
+  echo $$ > "$PID_FILE"
+  log "Worker supervisor daemon started (PID $$)"
+
+  while [ "$CLEANING_UP" -eq 0 ]; do
+    local app_dir; app_dir="$(find_artisan_dir)"
+    if [ -z "$app_dir" ] || [ ! -f "$app_dir/artisan" ]; then
+      # No Laravel app active in RAM - sleep and recheck
+      sleep 3
+      continue
+    fi
+
+    WWW_ROOT="$app_dir"
+    log "Laravel application detected in $WWW_ROOT - starting workers"
+    CHILD_PIDS=()
+
+    # 1. Start queue worker
+    su -s /bin/bash "$RUN_USER" -c "exec php '$WWW_ROOT/artisan' queue:work --sleep=3 --tries=3 --timeout=90" >> "$LOG_FILE" 2>&1 &
+    QUEUE_PID=$!
+    CHILD_PIDS+=("$QUEUE_PID")
+    log "Started queue worker (PID $QUEUE_PID)"
+
+    # 2. Start schedule worker (runs scheduled tasks every minute)
+    su -s /bin/bash "$RUN_USER" -c "exec php '$WWW_ROOT/artisan' schedule:work" >> "$LOG_FILE" 2>&1 &
+    SCHED_PID=$!
+    CHILD_PIDS+=("$SCHED_PID")
+    log "Started scheduler worker (PID $SCHED_PID)"
+
+    # 3. Optional custom workers from .wtc-workers or Procfile
+    if [ -f "$WWW_ROOT/.wtc-workers" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        # Strip name prefix if Procfile format (e.g. "worker: php ...")
+        cmd="${line#*:}"
+        cmd="$(echo "$cmd" | sed -e 's/^[[:space:]]*//')"
+        su -s /bin/bash "$RUN_USER" -c "cd '$WWW_ROOT' && exec $cmd" >> "$LOG_FILE" 2>&1 &
+        CPID=$!
+        CHILD_PIDS+=("$CPID")
+        log "Started custom worker '$cmd' (PID $CPID)"
+      done < "$WWW_ROOT/.wtc-workers"
+    fi
+
+    printf "%s\n" "${CHILD_PIDS[@]}" > "$CHILD_PIDS_FILE"
+
+    # Monitor loop: check if active site changed or workers died
+    while [ "$CLEANING_UP" -eq 0 ]; do
+      if [ ! -f "$WWW_ROOT/artisan" ]; then
+        log "Active site changed (artisan removed) - terminating workers"
+        break
+      fi
+
+      # Check queue worker
+      if ! kill -0 "$QUEUE_PID" 2>/dev/null; then
+        log "Queue worker (PID $QUEUE_PID) exited - restarting in 2s"
+        sleep 2
+        su -s /bin/bash "$RUN_USER" -c "exec php '$WWW_ROOT/artisan' queue:work --sleep=3 --tries=3 --timeout=90" >> "$LOG_FILE" 2>&1 &
+        QUEUE_PID=$!
+        log "Restarted queue worker (new PID $QUEUE_PID)"
+      fi
+
+      # Check schedule worker
+      if ! kill -0 "$SCHED_PID" 2>/dev/null; then
+        log "Schedule worker (PID $SCHED_PID) exited - restarting in 2s"
+        sleep 2
+        su -s /bin/bash "$RUN_USER" -c "exec php '$WWW_ROOT/artisan' schedule:work" >> "$LOG_FILE" 2>&1 &
+        SCHED_PID=$!
+        log "Restarted schedule worker (new PID $SCHED_PID)"
+      fi
+
+      sleep 3
+    done
+
+    # Clean up children before looping back to wait or restart
+    for pid in "${CHILD_PIDS[@]}"; do
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 1
+    for pid in "${CHILD_PIDS[@]}"; do
+      kill -9 "$pid" 2>/dev/null || true
+    done
+    CHILD_PIDS=()
+    rm -f "$CHILD_PIDS_FILE"
+  done
+}
+
+cmd_status() {
+  local is_json=0
+  if [ "${1:-}" = "--json" ]; then is_json=1; fi
+
+  local svc_active="no"
+  if systemctl is-active --quiet wtc-workers.service 2>/dev/null; then
+    svc_active="yes"
+  fi
+
+  local has_artisan="no"
+  if [ -f "$WWW_ROOT/artisan" ]; then
+    has_artisan="yes"
+  fi
+
+  # Find running PIDs for queue and schedule workers
+  local q_pid s_pid
+  q_pid="$(pgrep -f "artisan queue:work" 2>/dev/null | head -n1 || true)"
+  s_pid="$(pgrep -f "artisan schedule:work" 2>/dev/null | head -n1 || true)"
+
+  local q_running="no" s_running="no"
+  [ -n "$q_pid" ] && q_running="yes"
+  [ -n "$s_pid" ] && s_running="yes"
+
+  if [ "$is_json" -eq 1 ]; then
+    printf '{"service":"%s","has_artisan":%s,"queue":{"running":%s,"pid":"%s"},"schedule":{"running":%s,"pid":"%s"}}\n' \
+      "$svc_active" \
+      "$([ "$has_artisan" = yes ] && echo true || echo false)" \
+      "$([ "$q_running" = yes ] && echo true || echo false)" \
+      "$q_pid" \
+      "$([ "$s_running" = yes ] && echo true || echo false)" \
+      "$s_pid"
+  else
+    echo "Worker Service  : $svc_active"
+    echo "Laravel Artisan : $has_artisan"
+    echo "Queue Worker    : $([ "$q_running" = yes ] && echo "running (PID $q_pid)" || echo "stopped")"
+    echo "Schedule Worker : $([ "$s_running" = yes ] && echo "running (PID $s_pid)" || echo "stopped")"
+  fi
+}
+
+cmd_restart() {
+  log "Restart requested"
+  if [ -f "$WWW_ROOT/artisan" ]; then
+    su -s /bin/bash "$RUN_USER" -c "php '$WWW_ROOT/artisan' queue:restart" >> "$LOG_FILE" 2>&1 || true
+  fi
+  pkill -f "artisan queue:work" 2>/dev/null || true
+  pkill -f "artisan schedule:work" 2>/dev/null || true
+  systemctl restart --no-block wtc-workers.service 2>/dev/null || true
+  echo "Workers restarted."
+}
+
+cmd_start() {
+  systemctl start --no-block wtc-workers.service 2>/dev/null || true
+  echo "Workers service started."
+}
+
+cmd_stop() {
+  if systemctl is-active --quiet wtc-workers.service 2>/dev/null; then
+    systemctl stop --no-block wtc-workers.service 2>/dev/null || true
+  fi
+  pkill -f "artisan queue:work" 2>/dev/null || true
+  pkill -f "artisan schedule:work" 2>/dev/null || true
+  rm -f "$PID_FILE" "$CHILD_PIDS_FILE"
+  echo "Workers stopped."
+}
+
+cmd_logs() {
+  local n="${1:-50}"
+  [[ "$n" =~ ^[0-9]{1,4}$ ]] || n=50
+  if [ -f "$LOG_FILE" ]; then
+    tail -n "$n" "$LOG_FILE"
+  else
+    journalctl -u wtc-workers.service -n "$n" --no-pager 2>/dev/null || echo "No logs found."
+  fi
+}
+
+case "${1:-status}" in
+  run)     cmd_run ;;
+  status)  cmd_status "${2:-}" ;;
+  restart) cmd_restart ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  logs)    cmd_logs "${2:-50}" ;;
+  *)
+    echo "Usage: wtc-workers {run|status|start|stop|restart|logs}"
+    exit 1
+    ;;
+esac
