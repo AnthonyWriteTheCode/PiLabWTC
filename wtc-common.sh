@@ -17,6 +17,9 @@ WTC_CONF="${WTC_CONF:-/etc/wtc-web/wtc.conf}"
 : "${SAVE_INTERVAL_MIN:=0}"
 : "${SAMBA_GUEST:=yes}"
 : "${FTP_GUEST:=yes}"
+: "${FAN_ON_WIFI_DISCONNECT:=no}"
+: "${FAN_WIFI_MODE:=pulse}"
+: "${FAN_GPIO:=14}"
 
 # ---- paths ----
 : "${SITES_DIR:=/opt/wtc-web/sites}"
@@ -59,6 +62,67 @@ die() { log "ERROR: $*"; exit 1; }
 
 need_root() {
   [ "$(id -u)" -eq 0 ] || die "Must be run as root (use sudo)."
+}
+
+# Safely extract .tar.gz, .tgz, .tar, or .zip archive into destDir with ZipSlip & symlink defenses
+safe_extract_archive() {
+  local archive="$1" destDir="$2" listing=""
+  [ -f "$archive" ] || die "Archive not found: $archive"
+  mkdir -p "$destDir"
+
+  local -a tar_cmd=(tar)
+  if command -v pigz >/dev/null 2>&1; then
+    tar_cmd=(tar --use-compress-program=pigz)
+  fi
+
+  case "$archive" in
+    *.tar.gz|*.tgz)
+      listing="$("${tar_cmd[@]}" -tf "$archive" 2>/dev/null)" || die "Invalid or corrupted tar archive"
+      ;;
+    *.tar)
+      listing="$(tar -tf "$archive" 2>/dev/null)" || die "Invalid or corrupted tar archive"
+      ;;
+    *.zip)
+      command -v unzip >/dev/null 2>&1 || die "unzip utility not installed"
+      listing="$(unzip -Z1 "$archive" 2>/dev/null)" || die "Invalid or corrupted zip archive"
+      ;;
+    *)
+      die "Unsupported archive format: $archive"
+      ;;
+  esac
+
+  # 1. Pre-check: Reject path traversal (ZipSlip / TarSlip)
+  if echo "$listing" | grep -Eq '(^|/)\.\.(/|$)|^/'; then
+    die "Archive rejected: contains absolute or parent directory ('..') path traversal"
+  fi
+
+  # 2. Extract
+  case "$archive" in
+    *.tar.gz|*.tgz)
+      "${tar_cmd[@]}" -xf "$archive" -C "$destDir" --no-same-owner --no-same-permissions || die "Tar extraction failed"
+      ;;
+    *.tar)
+      tar -xf "$archive" -C "$destDir" --no-same-owner --no-same-permissions || die "Tar extraction failed"
+      ;;
+    *.zip)
+      unzip -qo "$archive" -d "$destDir" || die "Zip extraction failed"
+      ;;
+  esac
+
+  # 3. Post-check: Audit symlinks. Remove any symlinks that resolve outside destDir or point to sensitive paths
+  local real_dest; real_dest="$(readlink -f "$destDir" 2>/dev/null || echo "$destDir")"
+  local link target real_target
+  while IFS= read -r link; do
+    [ -L "$link" ] || continue
+    target="$(readlink "$link" 2>/dev/null || true)"
+    real_target="$(readlink -f "$link" 2>/dev/null || true)"
+    # If symlink points to absolute system path or outside destDir, purge it
+    if [[ "$target" == /* ]] || [ -z "$real_target" ] || [[ "$real_target" != "$real_dest"* ]]; then
+      log "Security Warning: Removed unsafe symlink in archive: $link -> $target"
+      rm -f "$link"
+    fi
+  done < <(find "$destDir" -type l 2>/dev/null || true)
+  return 0
 }
 
 # Site IDs: lowercase letters, digits, '-' and '_'.
@@ -149,6 +213,16 @@ EOF
   if [ ! -L "$NGINX_SNIPPET" ] || [ "$(readlink -f "$NGINX_SNIPPET" 2>/dev/null)" != "$RAM_NGINX_CONF" ]; then
     ln -sfn "$RAM_NGINX_CONF" "$NGINX_SNIPPET" 2>/dev/null || true
   fi
+
+  # Restore persistent security patch receipts from SD storage into RAM disk
+  for pf_src in /etc/wtc-web/applied_patches.json /opt/wtc-web/applied_patches.json /var/lib/wtc-web/applied_patches.json; do
+    if [ -f "$pf_src" ]; then
+      cp -f "$pf_src" "$RAM_MOUNT/applied_patches.json" 2>/dev/null || true
+      cp -f "$pf_src" "/tmp/applied_patches.json" 2>/dev/null || true
+      chmod 0666 "$RAM_MOUNT/applied_patches.json" "/tmp/applied_patches.json" 2>/dev/null || true
+      break
+    fi
+  done
 }
 
 # Sync main Web Management UI from SD card (/opt/wtc-web/ui) into RAM drive (/mnt/ramdisk/ui)
@@ -169,12 +243,144 @@ reload_ui_ram() {
   fi
 }
 
+# Preserve working site configs (.env, database credentials, .wtc-database.sql, SQLite, storage/app)
+# from being overwritten when re-uploading or updating an application package.
+preserve_existing_site_configs() {
+  local site="$1" staged="$2" slug live="" old_archive="" ext_tmp=""
+  [ -n "$site" ] && [ -d "$staged" ] || return 0
+
+  slug="$(site_slug "$site")"
+  if [ -d "$RAM_SITES_DIR/$slug" ]; then
+    live="$RAM_SITES_DIR/$slug"
+  fi
+  old_archive="$SITES_DIR/$site.tar.gz"
+
+  # If not live in RAM, but an existing archive package exists, extract protected files to inspect
+  if [ -z "$live" ] && [ -f "$old_archive" ]; then
+    ext_tmp="$(mktemp -d "${STAGE_DIR:-/tmp}/.prev_extract.XXXXXX" 2>/dev/null || mktemp -d "/tmp/.prev_extract.XXXXXX")"
+    tar -xf "$old_archive" -C "$ext_tmp" --no-same-owner --no-same-permissions 2>/dev/null || true
+    live="$ext_tmp"
+  fi
+
+  [ -n "$live" ] && [ -d "$live" ] || return 0
+
+  # Collect protected patterns (defaults + gitignore + wtc-protected.json)
+  local patterns=('.env' '.env.*' '.wtc-database.sql' '.wtc-db.sql' '.wtc-db.php' 'nginx.conf' 'wtc.json' 'wp-config.php')
+
+  # Read custom patterns from .wtc-protected.json if written by UI or user
+  local pjson
+  for pjson in "$staged/.wtc-protected.json" "$live/.wtc-protected.json"; do
+    if [ -f "$pjson" ] && command -v jq >/dev/null; then
+      while IFS= read -r p; do
+        [ -n "$p" ] && patterns+=("$p")
+      done < <(jq -r '.[]? // empty' "$pjson" 2>/dev/null || true)
+    fi
+  done
+
+  # Read gitignore/wtcignore rules for configs, databases, and keys
+  local gi
+  for gi in "$staged/.gitignore" "$live/.gitignore" "$staged/.wtcignore" "$live/.wtcignore"; do
+    if [ -f "$gi" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        line="$(echo "$line" | sed -e 's/[[:space:]]*#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -n "$line" ] || continue
+        line="${line#/}"
+        if [[ "$line" =~ (\.env|\.sql|\.sqlite|\.db|storage|config|secret|key|upload) ]]; then
+          patterns+=("$line")
+        fi
+      done < "$gi"
+    fi
+  done
+
+  # 1. Protect & merge .env
+  if [ -f "$live/.env" ]; then
+    if [ ! -f "$staged/.env" ]; then
+      cp -p "$live/.env" "$staged/.env" 2>/dev/null || true
+    else
+      # Live .env is the authority on the server.
+      # Keep live .env completely, and only append genuinely new keys from staged .env
+      local merged_tmp; merged_tmp="$(mktemp "${STAGE_DIR:-/tmp}/.env_merged.XXXXXX" 2>/dev/null || mktemp "/tmp/.env_merged.XXXXXX")"
+      cp -p "$live/.env" "$merged_tmp"
+      while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        local k="${line%%=*}"
+        k="$(echo "$k" | tr -d '[:space:]')"
+        [ -n "$k" ] || continue
+        if ! grep -qE "^[[:space:]]*${k}=" "$live/.env" 2>/dev/null; then
+          echo "$line" >> "$merged_tmp"
+        fi
+      done < "$staged/.env"
+      mv -f "$merged_tmp" "$staged/.env"
+    fi
+  fi
+
+  # 2. Preserve .wtc-db.php (managed database helper)
+  if [ -f "$live/.wtc-db.php" ] && [ ! -f "$staged/.wtc-db.php" ]; then
+    cp -p "$live/.wtc-db.php" "$staged/.wtc-db.php" 2>/dev/null || true
+  fi
+
+  # 3. Preserve database snapshot dump (.wtc-database.sql or .wtc-db.sql)
+  if [ ! -f "$staged/.wtc-database.sql" ] && [ ! -f "$staged/.wtc-db.sql" ]; then
+    if [ -f "$live/.wtc-database.sql" ]; then
+      cp -p "$live/.wtc-database.sql" "$staged/.wtc-database.sql" 2>/dev/null || true
+    elif [ -f "$live/.wtc-db.sql" ]; then
+      cp -p "$live/.wtc-db.sql" "$staged/.wtc-db.sql" 2>/dev/null || true
+    fi
+  fi
+
+  # 4. Preserve SQLite databases (database/database.sqlite or *.sqlite, *.db)
+  local sqldb
+  for sqldb in database/database.sqlite database/*.sqlite storage/*.sqlite *.sqlite *.db; do
+    if [ -f "$live/$sqldb" ]; then
+      if [ ! -f "$staged/$sqldb" ] || [ ! -s "$staged/$sqldb" ]; then
+        mkdir -p "$(dirname "$staged/$sqldb")" 2>/dev/null || true
+        cp -p "$live/$sqldb" "$staged/$sqldb" 2>/dev/null || true
+      fi
+    fi
+  done
+
+  # 5. Preserve user uploads & persisted media (storage/app)
+  if [ -d "$live/storage/app" ]; then
+    mkdir -p "$staged/storage/app" 2>/dev/null || true
+    cp -rn "$live/storage/app"/* "$staged/storage/app"/ 2>/dev/null || true
+  fi
+
+  # 6. Check all custom and gitignore patterns
+  local pat match_f rel_f
+  for pat in "${patterns[@]}"; do
+    [ -n "$pat" ] || continue
+    if [[ "$pat" == *"*"* ]] || [ -d "$live/$pat" ]; then
+      while IFS= read -r match_f; do
+        [ -f "$match_f" ] || continue
+        rel_f="${match_f#$live/}"
+        if [ -f "$live/$rel_f" ]; then
+          mkdir -p "$(dirname "$staged/$rel_f")" 2>/dev/null || true
+          if [ ! -f "$staged/$rel_f" ] || [ ! -s "$staged/$rel_f" ]; then
+            cp -p "$live/$rel_f" "$staged/$rel_f" 2>/dev/null || true
+          fi
+        fi
+      done < <(find "$live" -type f -path "$live/$pat" 2>/dev/null || true)
+    else
+      if [ -f "$live/$pat" ]; then
+        mkdir -p "$(dirname "$staged/$pat")" 2>/dev/null || true
+        if [ ! -f "$staged/$pat" ] || [ ! -s "$staged/$pat" ]; then
+          cp -p "$live/$pat" "$staged/$pat" 2>/dev/null || true
+        fi
+      fi
+    fi
+  done
+
+  [ -n "$ext_tmp" ] && [ -d "$ext_tmp" ] && rm -rf "$ext_tmp" || true
+}
+
 # Pack <dir> into SITES_DIR/<name>.tar.gz atomically, keeping one previous copy.
 # Also writes cached metadata in SITES_DIR/<name>.meta.json for instant UI listing.
 # Sets EXISTED=1 if the site already existed.
 store_dir_as_site() {
   local name="$1" dir="$2" out
   mkdir -p "$SITES_DIR" "$PREV_DIR"
+  preserve_existing_site_configs "$name" "$dir"
   out="$(mktemp "$SITES_DIR/.new.XXXXXX")"
   if ! tar -czf "$out" -C "$dir" .; then rm -f "$out"; return 1; fi
   EXISTED=0
@@ -233,7 +439,13 @@ set_conf() {
 }
 
 php_fpm_unit() {
-  systemctl list-unit-files --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}' | head -n1
+  local v u
+  v="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+  if [ -n "$v" ] && systemctl list-unit-files --no-legend "php${v}-fpm.service" 2>/dev/null | grep -q .; then
+    echo "php${v}-fpm.service"
+    return 0
+  fi
+  systemctl list-unit-files --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}' | sort -rV | head -n1
 }
 
 # ---------------------------------------------------------------- database (MariaDB)

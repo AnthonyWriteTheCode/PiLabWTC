@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# /usr/local/bin/wtc-network
+# WTC Network Resilience & Auto-Reconnect Watchdog Daemon
+# 1. Disables Wi-Fi power saving so Pi never sleeps or drops incoming web traffic.
+# 2. Checks Wi-Fi every NET_CHECK_INTERVAL seconds (default 10) and auto-reconnects.
+# 3. Spins or pulses the cooling fan while Wi-Fi is disconnected (if enabled in settings).
+set -Eeuo pipefail
+
+# shellcheck disable=SC1091
+. "${WTC_LIB:-/usr/local/lib/wtc-web/common.sh}"
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+LOG_FILE="/var/log/wtc-web/network.log"
+PID_FILE="/run/wtc-network.pid"
+FAN_STATE_FILE="/run/wtc-fan-alert.state"
+PULSE_PID_FILE="/run/wtc-fan-pulse.pid"
+STATUS_FILE="/run/wtc-network.status"
+WIFI_REASON=""
+RECONNECT_PID=""
+
+mkdir -p /var/log/wtc-web /run
+
+log() {
+  local msg
+  msg="$(date '+%Y-%m-%d %H:%M:%S') [wtc-network] $*"
+  echo "$msg" >> "$LOG_FILE"
+  echo "$msg"
+}
+
+# ------------------------------------------------------------ hardware fan control
+set_fan_state() {
+  local state="$1" # 1 = on, 0 = off
+  local pin_list="${FAN_GPIO:-14}"
+
+  # 1. HWMon PWM fans (Pi 5 active cooler, PWM fan overlays)
+  local pwm hdir
+  for pwm in /sys/class/hwmon/hwmon*/pwm1 /sys/devices/platform/cooling_fan/hwmon/hwmon*/pwm1; do
+    [ -f "$pwm" ] || continue
+    hdir="$(dirname "$pwm")"
+    if [ "$state" -eq 1 ]; then
+      [ -f "$hdir/pwm1_enable" ] && { echo 1 > "$hdir/pwm1_enable" 2>/dev/null || true; }
+      echo 255 > "$pwm" 2>/dev/null || true
+    else
+      echo 0 > "$pwm" 2>/dev/null || true
+      [ -f "$hdir/pwm1_enable" ] && { echo 2 > "$hdir/pwm1_enable" 2>/dev/null || true; }
+    fi
+  done
+
+  # 2. Thermal cooling devices - ONLY fans (never cpufreq throttling devices)
+  local cdev ctype max
+  for cdev in /sys/class/thermal/cooling_device*; do
+    [ -f "$cdev/cur_state" ] || continue
+    ctype="$(cat "$cdev/type" 2>/dev/null || true)"
+    [[ "$ctype" =~ [Ff][Aa][Nn] ]] || continue
+    max=1
+    [ -f "$cdev/max_state" ] && max="$(cat "$cdev/max_state" 2>/dev/null || echo 1)"
+    if [ "$state" -eq 1 ]; then
+      echo "$max" > "$cdev/cur_state" 2>/dev/null || true
+    else
+      echo 0 > "$cdev/cur_state" 2>/dev/null || true
+    fi
+  done
+
+  # 3. GPIO pins (single pin or comma-separated list like 14,18)
+  local p
+  local -a PINS
+  IFS=',' read -ra PINS <<< "$pin_list"
+  for p in "${PINS[@]}"; do
+    p="$(echo "$p" | tr -d '[:space:]')"
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+
+    if command -v pinctrl >/dev/null 2>&1; then
+      if [ "$state" -eq 1 ]; then pinctrl set "$p" op dh 2>/dev/null || true
+      else pinctrl set "$p" op dl 2>/dev/null || true; fi
+    elif command -v raspi-gpio >/dev/null 2>&1; then
+      if [ "$state" -eq 1 ]; then raspi-gpio set "$p" op dh 2>/dev/null || true
+      else raspi-gpio set "$p" op dl 2>/dev/null || true; fi
+    fi
+
+    if [ -d /sys/class/gpio ]; then
+      [ -d "/sys/class/gpio/gpio$p" ] || echo "$p" > /sys/class/gpio/export 2>/dev/null || true
+      if [ -d "/sys/class/gpio/gpio$p" ]; then
+        echo out > "/sys/class/gpio/gpio$p/direction" 2>/dev/null || true
+        echo "$state" > "/sys/class/gpio/gpio$p/value" 2>/dev/null || true
+      fi
+    fi
+
+    if command -v gpioset >/dev/null 2>&1; then
+      gpioset -m exit 0 "$p"="$state" 2>/dev/null || true
+    fi
+  done
+
+  if [ "$state" -eq 1 ]; then echo "1" > "$FAN_STATE_FILE"; else rm -f "$FAN_STATE_FILE"; fi
+  return 0
+}
+
+pulse_running() {
+  local ppid
+  [ -f "$PULSE_PID_FILE" ] || return 1
+  ppid="$(cat "$PULSE_PID_FILE" 2>/dev/null || true)"
+  [ -n "$ppid" ] && kill -0 "$ppid" 2>/dev/null
+}
+
+stop_fan_pulse() {
+  local ppid
+  if [ -f "$PULSE_PID_FILE" ]; then
+    ppid="$(cat "$PULSE_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$ppid" ]; then
+      pkill -P "$ppid" 2>/dev/null || true
+      kill "$ppid" 2>/dev/null || true
+    fi
+    rm -f "$PULSE_PID_FILE"
+  fi
+  set_fan_state 0
+}
+
+start_fan_pulse() {
+  pulse_running && return 0
+  (
+    while true; do
+      set_fan_state 1
+      sleep 1.5
+      set_fan_state 0
+      sleep 1.5
+    done
+  ) >/dev/null 2>&1 &
+  echo "$!" > "$PULSE_PID_FILE"
+  log "Fan pulse started (PID: $!)"
+}
+
+fan_alert_is_active() {
+  pulse_running && return 0
+  [ -f "$FAN_STATE_FILE" ] && [ "$(cat "$FAN_STATE_FILE" 2>/dev/null)" = "1" ]
+}
+
+# ------------------------------------------------------------ power save & auto-connect
+list_wifi_ifaces() {
+  ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -E '^(wl|wlan)' || true
+}
+
+disable_wifi_powersave() {
+  local iface
+  for iface in $(list_wifi_ifaces); do
+    command -v iw >/dev/null 2>&1 && { iw dev "$iface" set power_save off 2>/dev/null || true; }
+    command -v iwconfig >/dev/null 2>&1 && { iwconfig "$iface" power off 2>/dev/null || true; }
+  done
+  if [ -d /etc/NetworkManager/conf.d ] && [ ! -f /etc/NetworkManager/conf.d/default-wifi-powersave-disable.conf ]; then
+    printf '[connection]\nwifi.powersave = 2\n' > /etc/NetworkManager/conf.d/default-wifi-powersave-disable.conf
+  fi
+  return 0
+}
+
+configure_nm_autoconnect() {
+  if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    local con
+    while IFS= read -r con; do
+      [ -z "$con" ] && continue
+      nmcli connection modify "$con" connection.autoconnect yes connection.autoconnect-retries 0 2>/dev/null || true
+    done < <(nmcli -t -f NAME connection show 2>/dev/null || true)
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------ Wi-Fi connectivity detection
+# Returns 0 ONLY when a Wi-Fi interface has an IP AND reaches its gateway through that interface.
+# Sets WIFI_REASON on failure. Any doubt = disconnected.
+is_wifi_connected() {
+  WIFI_REASON=""
+
+  if command -v rfkill >/dev/null 2>&1 && rfkill list wifi 2>/dev/null | grep -qi "blocked: yes"; then
+    WIFI_REASON="Wi-Fi blocked by rfkill"
+    return 1
+  fi
+
+  local ifaces iface state ip_addr gw
+  ifaces="$(list_wifi_ifaces)"
+
+  if [ -z "$ifaces" ]; then
+    gw="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
+    if [ -n "$gw" ] && ping -c 1 -W 2 "$gw" >/dev/null 2>&1; then return 0; fi
+    WIFI_REASON="no Wi-Fi interface and gateway unreachable"
+    return 1
+  fi
+
+  for iface in $ifaces; do
+    state="$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || echo down)"
+    if [ "$state" != "up" ] && [ "$state" != "unknown" ]; then
+      WIFI_REASON="$iface link is $state"
+      continue
+    fi
+
+    if command -v iw >/dev/null 2>&1 && iw dev "$iface" link 2>/dev/null | grep -qi "not connected"; then
+      WIFI_REASON="$iface not associated with an access point"
+      continue
+    fi
+
+    ip_addr="$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+    if [ -z "$ip_addr" ]; then
+      WIFI_REASON="$iface has no IPv4 address"
+      continue
+    fi
+
+    gw="$(ip route show default dev "$iface" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
+    if [ -z "$gw" ]; then
+      WIFI_REASON="$iface has no default gateway"
+      continue
+    fi
+
+    if ping -I "$iface" -c 2 -W 2 "$gw" >/dev/null 2>&1; then
+      return 0
+    fi
+    WIFI_REASON="gateway $gw unreachable via $iface"
+  done
+
+  [ -n "$WIFI_REASON" ] || WIFI_REASON="no usable Wi-Fi connection"
+  return 1
+}
+
+# ------------------------------------------------------------ self-healing reconnect
+trigger_reconnect() {
+  command -v rfkill >/dev/null 2>&1 && { rfkill unblock wifi 2>/dev/null || true; }
+
+  if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    nmcli radio wifi on 2>/dev/null || true
+    local dev
+    for dev in $(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F':' '$2=="wifi"{print $1}'); do
+      timeout 20 nmcli device connect "$dev" >/dev/null 2>&1 || true
+    done
+  else
+    local iface
+    for iface in $(list_wifi_ifaces); do
+      command -v wpa_cli >/dev/null 2>&1 && { wpa_cli -i "$iface" reassociate >/dev/null 2>&1 || true; }
+      command -v dhcpcd >/dev/null 2>&1 && { timeout 20 dhcpcd -n "$iface" >/dev/null 2>&1 || true; }
+    done
+  fi
+
+  if command -v avahi-daemon >/dev/null 2>&1 && ! systemctl is-active --quiet avahi-daemon 2>/dev/null; then
+    systemctl restart avahi-daemon 2>/dev/null || true
+  fi
+  disable_wifi_powersave
+  return 0
+}
+
+reconnect_async() {
+  if [ -n "$RECONNECT_PID" ] && kill -0 "$RECONNECT_PID" 2>/dev/null; then
+    return 0
+  fi
+  ( trigger_reconnect ) >/dev/null 2>&1 &
+  RECONNECT_PID="$!"
+}
+
+# ------------------------------------------------------------ daemon loop
+run_daemon() {
+  # The watchdog must never die from a single failing command.
+  set +e
+  trap - ERR
+  echo "$$" > "$PID_FILE"
+  log "Starting WTC Network Watchdog (PID: $$)"
+
+  trap 'rm -f "$PID_FILE" "$STATUS_FILE"; stop_fan_pulse; log "Network watchdog stopped."; exit 0' INT TERM
+
+  disable_wifi_powersave
+  configure_nm_autoconnect
+
+  local last_state="" interval mode
+  while true; do
+    # Reload settings every tick so UI changes apply without restarting
+    # shellcheck disable=SC1090
+    [ -f "$WTC_CONF" ] && . "$WTC_CONF"
+    interval="${NET_CHECK_INTERVAL:-10}"
+    [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 2 ] || interval=10
+    mode="${FAN_WIFI_MODE:-pulse}"
+
+    disable_wifi_powersave
+
+    if is_wifi_connected; then
+      if [ "$last_state" != "connected" ]; then
+        log "Wi-Fi CONNECTED"
+        last_state="connected"
+      fi
+      echo "connected" > "$STATUS_FILE"
+      if fan_alert_is_active; then
+        log "Wi-Fi connected - fan alert stopped"
+        stop_fan_pulse
+      fi
+    else
+      if [ "$last_state" != "disconnected" ]; then
+        log "Wi-Fi DISCONNECTED: $WIFI_REASON"
+        last_state="disconnected"
+      fi
+      echo "disconnected: $WIFI_REASON" > "$STATUS_FILE"
+
+      if [ "${FAN_ON_WIFI_DISCONNECT:-no}" = "yes" ]; then
+        if [ "$mode" = "spin" ]; then
+          pulse_running && stop_fan_pulse
+          set_fan_state 1
+        else
+          start_fan_pulse
+        fi
+      elif fan_alert_is_active; then
+        stop_fan_pulse
+      fi
+
+      reconnect_async
+    fi
+
+    sleep "$interval"
+  done
+}
+
+cmd_check() {
+  echo "=== WTC Network & Wi-Fi Diagnostic ==="
+  echo "Check interval  : ${NET_CHECK_INTERVAL:-10}s"
+  echo "Fan Alert Opt   : ${FAN_ON_WIFI_DISCONNECT:-no} (Mode: ${FAN_WIFI_MODE:-pulse}, GPIO: ${FAN_GPIO:-14})"
+  echo "Fan Alert State : $(fan_alert_is_active && echo 'ACTIVE' || echo 'IDLE')"
+  echo "Daemon status   : $(cat "$STATUS_FILE" 2>/dev/null || echo 'not running')"
+
+  local iface state carrier ip_addr ps
+  for iface in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -E '^(wl|wlan|eth|en)' || true); do
+    state="$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || echo unknown)"
+    carrier="$(cat "/sys/class/net/$iface/carrier" 2>/dev/null || echo 0)"
+    ip_addr="$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+    ps="N/A"
+    if command -v iw >/dev/null 2>&1 && [[ "$iface" =~ ^wl ]]; then
+      ps="$(iw dev "$iface" get power_save 2>/dev/null | awk '{print $NF}' || echo unknown)"
+    fi
+    echo "Interface $iface : state=$state carrier=$carrier ip=${ip_addr:-none} powersave=$ps"
+  done
+
+  local pwm cdev
+  for pwm in /sys/class/hwmon/hwmon*/pwm1 /sys/devices/platform/cooling_fan/hwmon/hwmon*/pwm1; do
+    [ -f "$pwm" ] && echo "HWMon PWM fan   : $pwm"
+  done
+  for cdev in /sys/class/thermal/cooling_device*; do
+    [ -f "$cdev/cur_state" ] && echo "Cooling device  : $(basename "$cdev") ($(cat "$cdev/type" 2>/dev/null))"
+  done
+
+  if is_wifi_connected; then
+    echo "Wi-Fi (live)    : CONNECTED"
+  else
+    echo "Wi-Fi (live)    : DISCONNECTED - $WIFI_REASON"
+  fi
+  return 0
+}
+
+cmd_fan() {
+  local act="${1:-status}" sec="${2:-5}"
+  case "$act" in
+    on)    stop_fan_pulse; set_fan_state 1; echo "Fan turned ON" ;;
+    off)   stop_fan_pulse; echo "Fan turned OFF" ;;
+    pulse) start_fan_pulse; echo "Fan pulsing started" ;;
+    test)
+      echo "Testing fan for $sec seconds..."
+      if [ "${FAN_WIFI_MODE:-pulse}" = "spin" ]; then
+        set_fan_state 1; sleep "$sec"; set_fan_state 0
+      else
+        start_fan_pulse; sleep "$sec"; stop_fan_pulse
+      fi
+      echo "Fan test completed."
+      ;;
+    status) echo "Fan alert active: $(fan_alert_is_active && echo YES || echo NO)" ;;
+    *) echo "Usage: wtc-network fan on|off|pulse|test [sec]|status" >&2; exit 2 ;;
+  esac
+}
+
+main() {
+  case "${1:-check}" in
+    daemon)    run_daemon ;;
+    check)     cmd_check ;;
+    reconnect) trigger_reconnect ;;
+    powersave) disable_wifi_powersave; echo "Wi-Fi powersave disabled" ;;
+    fan)       cmd_fan "${2:-status}" "${3:-5}" ;;
+    *) echo "Usage: $0 daemon|check|reconnect|powersave|fan on|off|pulse|test|status" >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

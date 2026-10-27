@@ -113,6 +113,26 @@
             title: '🛡️ Updating Firewall Rules',
             sub: 'Configuring UFW rules and port filtering on the system...',
             icon: '🛡️'
+        },
+        'service_ctl': {
+            title: '⚙️ Managing Systemd Service',
+            sub: 'Sending lifecycle control signal to system daemon...',
+            icon: '⚙️'
+        },
+        'service_patch': {
+            title: '🛡️ Patching & Updating Service',
+            sub: 'Applying security patches and reloading system daemon...',
+            icon: '🛡️'
+        },
+        'service_patch_all': {
+            title: '🛡️ Patching All System Services',
+            sub: 'Upgrading all packages with pending security advisories...',
+            icon: '🛡️'
+        },
+        'security_remediate': {
+            title: '🔒 Applying Security Remediation',
+            sub: 'Hardening system configuration and applying fix...',
+            icon: '🔒'
         }
     };
 
@@ -242,7 +262,10 @@
         scripts.forEach(oldScript => {
             const newScript = document.createElement('script');
             Array.from(oldScript.attributes).forEach(attr => newScript.setAttribute(attr.name, attr.value));
-            newScript.textContent = oldScript.textContent;
+            // Tab scripts get re-injected on every SPA navigation; top-level let/const would throw
+            // "Identifier has already been declared" on the second run, so hoist them to var.
+            newScript.textContent = oldScript.src ? oldScript.textContent
+                : oldScript.textContent.replace(/^(let|const)\s+/gm, 'var ');
             oldScript.parentNode.replaceChild(newScript, oldScript);
         });
     }
@@ -474,6 +497,9 @@
 
             const url = new URL(link.href, window.location.origin);
             if (url.origin !== window.location.origin) return;
+
+            // Never intercept file downloads with SPA router
+            if (url.searchParams.has('download')) return;
 
             // Only intercept management UI links (/?p=... or /)
             if (url.pathname === '/' || url.pathname === '/index.php') {

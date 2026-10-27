@@ -28,11 +28,20 @@ if [ "${ID:-}" = ubuntu ]; then
   command -v add-apt-repository >/dev/null && add-apt-repository -y universe || true
 fi
 "${APT[@]}" update
-PKGS=(nginx mariadb-server php-fpm php-cli php-mysql php-sqlite3 php-curl php-mbstring php-xml php-zip rsync tar gzip unzip jq whiptail curl sudo openssh-server avahi-daemon)
+PKGS=(nginx mariadb-server php-fpm php-cli php-mysql php-sqlite3 php-curl php-mbstring php-xml php-zip rsync tar gzip pigz unzip jq whiptail curl sudo openssh-server avahi-daemon unattended-upgrades)
 [ "$ENABLE_SAMBA" = yes ] && PKGS+=(samba)
 [ "$ENABLE_FTP" = yes ] && PKGS+=(vsftpd)
 "${APT[@]}" install "${PKGS[@]}"
+echo "==> Hardening MariaDB bind-address to loopback (127.0.0.1)"
+mkdir -p /etc/mysql/mariadb.conf.d /etc/mysql/conf.d 2>/dev/null || true
+cat > /etc/mysql/mariadb.conf.d/99-wtc-bind.cnf <<'EOF'
+[mysqld]
+bind-address = 127.0.0.1
+EOF
+chmod 0644 /etc/mysql/mariadb.conf.d/99-wtc-bind.cnf 2>/dev/null || true
+[ -d /etc/mysql/conf.d ] && cp -f /etc/mysql/mariadb.conf.d/99-wtc-bind.cnf /etc/mysql/conf.d/99-wtc-bind.cnf 2>/dev/null || true
 systemctl enable --now mariadb avahi-daemon
+systemctl restart mariadb 2>/dev/null || true
 PHPV="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
 echo "    PHP $PHPV"
 
@@ -65,6 +74,7 @@ install -m 0644 "$SRC/wtc-common.sh"       /usr/local/lib/wtc-web/common.sh
 install -m 0755 "$SRC/03-site-service.sh"  /usr/local/bin/wtc-site-service
 install -m 0755 "$SRC/02-manage-site.sh"   /usr/local/bin/wtc-manage
 install -m 0755 "$SRC/wtc-workers"         /usr/local/bin/wtc-workers
+install -m 0755 "$SRC/wtc-network"         /usr/local/bin/wtc-network
 mkdir -p /opt/wtc-web/ui
 cp -r "$SRC/ui/"* /opt/wtc-web/ui/
 chmod -R u=rwX,go=rX /opt/wtc-web/ui
@@ -265,7 +275,7 @@ php_admin_value[max_input_time] = 600
 php_admin_value[memory_limit] = 512M
 php_admin_value[max_file_uploads] = 10000
 php_admin_value[max_input_vars] = 50000
-php_admin_value[open_basedir] = /opt/wtc-web/ui:/mnt/ramdisk/ui:/opt/wtc-web/sites:/mnt/ramdisk:/var/lib/wtc-web/sessions:/etc/wtc-web/ui-auth:/etc/nginx:/tmp
+php_admin_value[open_basedir] = /opt/wtc-web:/mnt/ramdisk:/var/lib/wtc-web:/etc/wtc-web:/etc/nginx:/etc/php:/etc/os-release:/tmp
 EOF
 
 # 2. Live Site Pool: Dedicated multi-worker processes for served websites
@@ -501,7 +511,7 @@ install -d /etc/systemd/system/nginx.service.d
 cat > /etc/systemd/system/nginx.service.d/wtc.conf <<'EOF'
 [Unit]
 Requires=wtc-ramdisk.service
-After=wtc-ramdisk.service
+After=wtc-ramdisk.service network.target
 EOF
 cat > /etc/systemd/system/wtc-dropbox.service <<'EOF'
 [Unit]
@@ -566,6 +576,38 @@ TimeoutStopSec=10s
 WantedBy=multi-user.target
 EOF
 
+echo "==> Configuring Network Resilience, Auto-Reconnect & Watchdog"
+install -d /etc/NetworkManager/conf.d /etc/udev/rules.d
+cat > /etc/NetworkManager/conf.d/default-wifi-powersave-disable.conf <<'EOF'
+[connection]
+wifi.powersave = 2
+EOF
+
+cat > /etc/udev/rules.d/70-wifi-powersave.rules <<'EOF'
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="wl*|wlan*", RUN+="/usr/bin/iw dev %k set power_save off"
+EOF
+
+cat > /etc/systemd/system/wtc-network.service <<'EOF'
+[Unit]
+Description=WTC Network Resilience, Auto-Reconnect & Fan Watchdog
+After=local-fs.target
+Wants=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/wtc-network daemon
+Restart=always
+RestartSec=5s
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable wtc-network.service
+
 if [ "$ENABLE_SAMBA" = yes ]; then
   echo "==> Configuring Samba"
   # shellcheck disable=SC1091
@@ -587,6 +629,23 @@ systemctl daemon-reload
 systemctl enable wtc-ramdisk.service wtc-dropbox.path wtc-save.timer wtc-workers.service nginx "$FPM_UNIT" ssh avahi-daemon
 [ "$ENABLE_FTP" = yes ] && systemctl enable vsftpd || true
 
+echo "==> Optimizing boot performance & eliminating wait-online stalls"
+# Disable wait-online services that stall boot for 60-120s if Wi-Fi associates slowly or Ethernet is unplugged
+systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+systemctl mask NetworkManager-wait-online.service 2>/dev/null || true
+systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
+systemctl mask systemd-networkd-wait-online.service 2>/dev/null || true
+
+# Disable unused Bluetooth UART initialization (saves 15-25s on Pi boot)
+systemctl disable hciuart.service 2>/dev/null || true
+systemctl disable bluetooth.service 2>/dev/null || true
+
+# Disable cloud-init if installed (common on Ubuntu Server Pi images; saves 30-60s)
+if [ -d /etc/cloud ]; then
+  touch /etc/cloud/cloud-init.disabled 2>/dev/null || true
+  systemctl disable cloud-init.service cloud-init-local.service cloud-config.service cloud-final.service 2>/dev/null || true
+fi
+
 echo "==> Starting wtc-ramdisk service"
 rm -f /run/wtc-web.lock 2>/dev/null || true
 systemctl restart avahi-daemon 2>/dev/null || true
@@ -606,6 +665,47 @@ systemctl start wtc-dropbox.path wtc-save.timer || true
 
 echo "==> Loading default portal (site-alpha) into RAM"
 /usr/local/bin/wtc-site-service --swap site-alpha || true
+
+echo "==> Installing deliberately outdated PHP-FPM (patch-validation test target)"
+# Installs an older PHP branch side-by-side so the vulnerability scanner has a real,
+# genuinely vulnerable target and the 1-click patch can be validated end-to-end.
+# It is never used by the UI or sites and listens only on its own unix socket.
+install_test_php() {
+  local main_v="$PHPV" test_v="" cand ver pins=() p
+  if [ "${ID:-}" = ubuntu ]; then
+    command -v add-apt-repository >/dev/null 2>&1 || "${APT[@]}" install software-properties-common
+    add-apt-repository -y ppa:ondrej/php || return 1
+  elif [ "${ID:-}" = debian ] || [ "${ID:-}" = raspbian ]; then
+    curl -fsSL https://packages.sury.org/php/apt.sh | bash || return 1
+  else
+    return 1
+  fi
+  "${APT[@]}" update || true
+
+  # Go back a few branches: first older branch that apt can actually provide.
+  for cand in 8.1 8.2 8.0 8.3 7.4; do
+    [ "$cand" = "$main_v" ] && continue
+    if apt-cache policy "php${cand}-fpm" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+      test_v="$cand"; break
+    fi
+  done
+  [ -n "$test_v" ] || return 1
+
+  # Prefer the oldest build still published for that branch (most likely to be vulnerable).
+  ver="$(apt-cache madison "php${test_v}-fpm" 2>/dev/null | awk '{print $3}' | sort -V | head -n1)"
+  for p in fpm cli common opcache readline; do pins+=("php${test_v}-${p}=${ver}"); done
+  if [ -z "$ver" ] || ! "${APT[@]}" --allow-downgrades install "${pins[@]}"; then
+    "${APT[@]}" install "php${test_v}-fpm" || return 1
+  fi
+
+  # The main PHP must remain the default CLI and the default FPM socket.
+  update-alternatives --set php "/usr/bin/php${main_v}" 2>/dev/null || true
+  update-alternatives --set php-fpm.sock "/run/php/php${main_v}-fpm.sock" 2>/dev/null || true
+  systemctl enable --now "php${test_v}-fpm.service" || true
+  systemctl restart "$FPM_UNIT" || true
+  echo "    Test target installed: php${test_v}-fpm $(dpkg-query -W -f='${Version}' "php${test_v}-fpm" 2>/dev/null)"
+}
+install_test_php || echo "Warning: could not install outdated test PHP (continuing; optional)" >&2
 
 # Verification check
 HTTP_STATUS="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/ || echo "failed")"

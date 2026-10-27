@@ -181,9 +181,17 @@ $hostIp = explode(' ', $deviceStatus['ips'] ?? '')[0] ?? ($_SERVER['SERVER_ADDR'
             <!-- Laravel DB Migration & Seed Checkboxes -->
             <div id="pageLaravelDbBox" style="grid-column:1 / -1;background:#11171e;border:1px solid #2a3541;border-radius:6px;padding:12px 14px;margin-top:6px">
                 <div style="font-weight:600;font-size:0.88rem;color:#7cc4ff;margin-bottom:6px">
-                    🗄️ Database Initialization &amp; Seeders:
+                    ⚡ Laravel Post-Upload &amp; Database Actions:
                 </div>
-                <div style="display:flex;gap:20px;flex-wrap:wrap">
+                <div style="display:flex;gap:18px;flex-wrap:wrap">
+                    <label style="font-size:0.84rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
+                        <input type="checkbox" id="envChkRouteClear" checked onchange="syncDbCheckboxes('env')">
+                        <span>🧹 <b>Clear route cache</b> (<code>php artisan route:clear</code>)</span>
+                    </label>
+                    <label style="font-size:0.84rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
+                        <input type="checkbox" id="envChkOptimizeClear" checked onchange="syncDbCheckboxes('env')">
+                        <span>✨ <b>Clear all caches</b> (<code>php artisan optimize:clear</code>)</span>
+                    </label>
                     <label style="font-size:0.84rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
                         <input type="checkbox" id="envChkMigrate" checked onchange="syncDbCheckboxes('env')">
                         <span>⚡ <b>Run migrations</b> (<code>php artisan migrate --force</code>)</span>
@@ -191,6 +199,10 @@ $hostIp = explode(' ', $deviceStatus['ips'] ?? '')[0] ?? ($_SERVER['SERVER_ADDR'
                     <label style="font-size:0.84rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
                         <input type="checkbox" id="envChkSeed" onchange="syncDbCheckboxes('env')">
                         <span>🌱 <b>Run seeders</b> (<code>php artisan db:seed --force</code>)</span>
+                    </label>
+                    <label style="font-size:0.84rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
+                        <input type="checkbox" id="envChkStorageLink" checked onchange="syncDbCheckboxes('env')">
+                        <span>🔗 <b>Link storage</b> (<code>php artisan storage:link --force</code>)</span>
                     </label>
                 </div>
             </div>
@@ -228,6 +240,103 @@ $hostIp = explode(' ', $deviceStatus['ips'] ?? '')[0] ?? ($_SERVER['SERVER_ADDR'
         </div>
     </div>
 
+    <!-- Protected Files & Overwrite Prevention Panel -->
+    <div id="protectedFilesPanel" class="stack-panel" style="display:none;border-color:#238636;background:#0d1611">
+        <div class="card-head" style="margin-bottom:8px">
+            <div>
+                <h4 style="color:#7ee787;margin-bottom:2px">🛡️ Protected Files (Do Not Overwrite)</h4>
+                <p style="font-size:0.84rem;color:#8b949e">
+                    Select files and configs to protect from being overwritten when updating or re-uploading. Preserves server database credentials, <code>.env</code>, SQLite data, and uploaded media.
+                </p>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <span style="font-size:0.75rem;color:#8b949e">Preset:</span>
+                <select id="selProtectPreset" onchange="applyProtectPreset(this.value)" style="background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:0.78rem">
+                    <option value="auto">⚡ Auto (from Stack)</option>
+                    <option value="laravel">🅰️ Laravel</option>
+                    <option value="react">⚛️ React / SPA / Vite</option>
+                    <option value="wordpress">📝 WordPress</option>
+                    <option value="php">🐘 Classic PHP</option>
+                    <option value="static">📄 Static HTML</option>
+                    <option value="custom">⚙️ Custom Only</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Checkbox grid for common protected file categories -->
+        <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));gap:10px;margin-top:10px">
+            <label style="background:#111e16;border:1px solid #238636;border-radius:6px;padding:8px 12px;font-size:0.84rem;color:#c9d1d9;display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+                <input type="checkbox" id="chkProtectEnv" checked onchange="updateProtectedCountBadge()" style="margin-top:2px">
+                <div>
+                    <b style="color:#7ee787">🔒 <code>.env</code> &amp; Credentials</b>
+                    <div style="font-size:0.76rem;color:#8b949e">Preserves server DB host/pass &amp; APP_KEY. Merges new keys.</div>
+                </div>
+            </label>
+
+            <label style="background:#111e16;border:1px solid #238636;border-radius:6px;padding:8px 12px;font-size:0.84rem;color:#c9d1d9;display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+                <input type="checkbox" id="chkProtectSqlite" checked onchange="updateProtectedCountBadge()" style="margin-top:2px">
+                <div>
+                    <b style="color:#7ee787">🗄️ SQLite Databases (<code>*.sqlite</code>, <code>*.db</code>)</b>
+                    <div style="font-size:0.76rem;color:#8b949e">Prevents active SQLite databases from being overwritten.</div>
+                </div>
+            </label>
+
+            <label style="background:#111e16;border:1px solid #238636;border-radius:6px;padding:8px 12px;font-size:0.84rem;color:#c9d1d9;display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+                <input type="checkbox" id="chkProtectDbDump" checked onchange="updateProtectedCountBadge()" style="margin-top:2px">
+                <div>
+                    <b style="color:#7ee787">📦 <code>.wtc-database.sql</code> &amp; DB Helper</b>
+                    <div style="font-size:0.76rem;color:#8b949e">Keeps server's working DB snapshot &amp; <code>.wtc-db.php</code>.</div>
+                </div>
+            </label>
+
+            <label style="background:#111e16;border:1px solid #238636;border-radius:6px;padding:8px 12px;font-size:0.84rem;color:#c9d1d9;display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+                <input type="checkbox" id="chkProtectStorage" checked onchange="updateProtectedCountBadge()" style="margin-top:2px">
+                <div>
+                    <b style="color:#7ee787">📁 User Uploads &amp; Media</b>
+                    <div style="font-size:0.76rem;color:#8b949e">Preserves <code>storage/app/**</code> &amp; <code>uploads/**</code> directories.</div>
+                </div>
+            </label>
+
+            <label style="background:#111e16;border:1px solid #238636;border-radius:6px;padding:8px 12px;font-size:0.84rem;color:#c9d1d9;display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+                <input type="checkbox" id="chkProtectNginx" checked onchange="updateProtectedCountBadge()" style="margin-top:2px">
+                <div>
+                    <b style="color:#7ee787">⚙️ Web Server &amp; Host Config</b>
+                    <div style="font-size:0.76rem;color:#8b949e">Preserves <code>nginx.conf</code>, <code>wtc.json</code>, and <code>.htaccess</code>.</div>
+                </div>
+            </label>
+
+            <label style="background:#111e16;border:1px solid #238636;border-radius:6px;padding:8px 12px;font-size:0.84rem;color:#c9d1d9;display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+                <input type="checkbox" id="chkProtectWpConfig" checked onchange="updateProtectedCountBadge()" style="margin-top:2px">
+                <div>
+                    <b style="color:#7ee787">📝 <code>wp-config.php</code> (WordPress)</b>
+                    <div style="font-size:0.76rem;color:#8b949e">Protects WordPress database constants and auth salts.</div>
+                </div>
+            </label>
+        </div>
+
+        <!-- Gitignore auto-detection banner & toggle -->
+        <div id="dropGitignoreBox" style="margin-top:10px;padding:10px 14px;background:#101d14;border:1px solid #238636;border-radius:6px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+            <label style="display:flex;align-items:center;gap:8px;font-size:0.84rem;color:#c9d1d9;cursor:pointer">
+                <input type="checkbox" id="chkProtectGitignore" checked onchange="updateProtectedCountBadge()">
+                <span>📄 <b>Include rules from <code>.gitignore</code></b> (Auto-protect developer-ignored files)</span>
+            </label>
+            <div id="dropGitignoreNotice" style="font-size:0.78rem;color:#7ee787">Ready to inspect .gitignore when dropped</div>
+        </div>
+
+        <!-- Custom Protected Patterns Input -->
+        <div style="margin-top:10px;padding:10px 14px;background:#11161d;border:1px solid #21262d;border-radius:6px">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:6px">
+                <b style="font-size:0.84rem;color:#79c0ff">➕ Custom Protected Patterns &amp; Globs:</b>
+                <small style="color:#8b949e">e.g. <code>config/custom.php</code>, <code>keys/*.pem</code>, <code>local.json</code></small>
+            </div>
+            <div style="display:flex;gap:6px">
+                <input type="text" id="txtCustomProtect" placeholder="Enter path or glob pattern (e.g. config/local.php)" style="flex:1;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:0.82rem" onkeydown="if(event.key==='Enter'){event.preventDefault();addCustomProtectPattern();}">
+                <button type="button" class="btn" style="padding:4px 12px;font-size:0.82rem" onclick="addCustomProtectPattern()">Add Pattern</button>
+            </div>
+            <div id="customProtectChips" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"></div>
+        </div>
+    </div>
+
     <!-- Folder Exclusion & Upload Confirmation Modal -->
     <div id="folderExclusionModal" class="modal-backdrop" style="display:none">
         <div class="modal-dialog">
@@ -249,10 +358,18 @@ $hostIp = explode(' ', $deviceStatus['ips'] ?? '')[0] ?? ($_SERVER['SERVER_ADDR'
                 <!-- Laravel Database Options (when Laravel detected) -->
                 <div id="modalLaravelDbBox" class="modal-info-box" style="display:none;border-color:#388bfd;background:#0d1825;margin-bottom:12px;padding:12px 14px">
                     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:6px">
-                        <b style="color:#7cc4ff;font-size:0.9rem">🗄️ Laravel Database Setup:</b>
+                        <b style="color:#7cc4ff;font-size:0.9rem">⚡ Laravel Post-Upload &amp; Database Actions:</b>
                         <small style="color:#8b949e">Auto-wires with MariaDB <code>w_site</code></small>
                     </div>
-                    <div style="display:flex;gap:20px;flex-wrap:wrap">
+                    <div style="display:flex;gap:18px;flex-wrap:wrap">
+                        <label style="font-size:0.85rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
+                            <input type="checkbox" id="modalChkRouteClear" checked onchange="syncDbCheckboxes('modal')">
+                            <span>🧹 <b>Clear Route Cache</b> (<code>php artisan route:clear</code>)</span>
+                        </label>
+                        <label style="font-size:0.85rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
+                            <input type="checkbox" id="modalChkOptimizeClear" checked onchange="syncDbCheckboxes('modal')">
+                            <span>✨ <b>Clear All Caches</b> (<code>php artisan optimize:clear</code>)</span>
+                        </label>
                         <label style="font-size:0.85rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
                             <input type="checkbox" id="modalChkMigrate" checked onchange="syncDbCheckboxes('modal')">
                             <span>⚡ <b>Run Migrations</b> (<code>php artisan migrate</code>)</span>
@@ -260,6 +377,10 @@ $hostIp = explode(' ', $deviceStatus['ips'] ?? '')[0] ?? ($_SERVER['SERVER_ADDR'
                         <label style="font-size:0.85rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
                             <input type="checkbox" id="modalChkSeed" onchange="syncDbCheckboxes('modal')">
                             <span>🌱 <b>Run Seeders</b> (<code>php artisan db:seed</code>)</span>
+                        </label>
+                        <label style="font-size:0.85rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
+                            <input type="checkbox" id="modalChkStorageLink" checked onchange="syncDbCheckboxes('modal')">
+                            <span>🔗 <b>Link Storage</b> (<code>php artisan storage:link</code>)</span>
                         </label>
                     </div>
                 </div>
@@ -299,7 +420,12 @@ $hostIp = explode(' ', $deviceStatus['ips'] ?? '')[0] ?? ($_SERVER['SERVER_ADDR'
             <input type="checkbox" id="dropSpinUp" checked>
             <b>⚡ Spin up site immediately (Live in RAM)</b>
         </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem;color:#c9d1d9;cursor:pointer">
+            <input type="checkbox" id="dropAutoUpdate" checked>
+            <b>🔄 Auto-update existing site on drop</b>
+        </label>
         <span class="sp"></span>
+        <button type="button" class="btn" id="btnManageProtected" onclick="toggleProtectedPanel()" style="border-color:#238636;color:#7ee787">🛡️ Protected Configs (<span id="protectedCountBadge">6</span>)</button>
         <button type="button" class="btn" id="btnManageFolders" style="display:none" onclick="openFolderExclusionModal()">📂 Filter Folders</button>
         <button type="button" class="btn-pri" id="btnSubmitDeploy" style="display:none" onclick="submitStagedFiles()">🚀 Deploy &amp; Spin Up</button>
     </div>
@@ -348,6 +474,7 @@ window.WTC_PROFILES = <?= json_encode($stackProfiles) ?>;
 window.WTC_STACK = <?= json_encode($deviceStack) ?>;
 window.WTC_STATUS = <?= json_encode($deviceStatus) ?>;
 window.WTC_HOST_IP = '<?= $hostIp ?>';
+window.WTC_EXISTING_SITES = <?= json_encode(array_column(wj('sites'), 'name')) ?>;
 
 (function() {
     const dropArea = document.getElementById('dropArea');
@@ -371,7 +498,183 @@ window.WTC_HOST_IP = '<?= $hostIp ?>';
     let missingComponents = [];
     let isPublicOnlyLaravel = false;
     let folderFilterState = {}; // folderName -> boolean (true = include)
-    let detectedTopFolders = [];
+    let customProtectPatterns = [];
+    let discoveredGitignoreRules = [];
+
+    const STACK_PROTECT_PRESETS = {
+        laravel: ['.env', '.env.*', 'database/*.sqlite', 'database/database.sqlite', '.wtc-database.sql', '.wtc-db.sql', '.wtc-db.php', 'storage/app/**', 'nginx.conf'],
+        react: ['.env', '.env.*', '.env.local', '.env.production', 'dist/**', 'build/**', '.wtc-db.php', 'nginx.conf'],
+        wordpress: ['wp-config.php', 'wp-content/uploads/**', '.htaccess', '.wtc-database.sql', '.wtc-db.php', 'nginx.conf'],
+        php: ['.env', '.env.*', 'config.local.php', 'config.php', 'database/*.sqlite', '*.sqlite', 'uploads/**', '.wtc-database.sql', '.wtc-db.php', 'nginx.conf'],
+        static: ['nginx.conf', 'wtc.json', '.wtc-database.sql'],
+        custom: []
+    };
+
+    window.toggleProtectedPanel = function() {
+        const p = document.getElementById('protectedFilesPanel');
+        if (!p) return;
+        p.style.display = (p.style.display === 'none' || !p.style.display) ? 'block' : 'none';
+        if (p.style.display === 'block') {
+            p.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+    };
+
+    window.applyProtectPreset = function(preset) {
+        if (!preset) return;
+        if (preset === 'auto') {
+            preset = detectedStackId || 'php';
+        }
+        const sel = document.getElementById('selProtectPreset');
+        if (sel) sel.value = preset;
+
+        const chkEnv = document.getElementById('chkProtectEnv');
+        const chkSqlite = document.getElementById('chkProtectSqlite');
+        const chkDbDump = document.getElementById('chkProtectDbDump');
+        const chkStorage = document.getElementById('chkProtectStorage');
+        const chkNginx = document.getElementById('chkProtectNginx');
+        const chkWpConfig = document.getElementById('chkProtectWpConfig');
+
+        if (preset === 'laravel') {
+            if (chkEnv) chkEnv.checked = true;
+            if (chkSqlite) chkSqlite.checked = true;
+            if (chkDbDump) chkDbDump.checked = true;
+            if (chkStorage) chkStorage.checked = true;
+            if (chkNginx) chkNginx.checked = true;
+            if (chkWpConfig) chkWpConfig.checked = false;
+        } else if (preset === 'react') {
+            if (chkEnv) chkEnv.checked = true;
+            if (chkSqlite) chkSqlite.checked = false;
+            if (chkDbDump) chkDbDump.checked = false;
+            if (chkStorage) chkStorage.checked = false;
+            if (chkNginx) chkNginx.checked = true;
+            if (chkWpConfig) chkWpConfig.checked = false;
+        } else if (preset === 'wordpress') {
+            if (chkEnv) chkEnv.checked = false;
+            if (chkSqlite) chkSqlite.checked = false;
+            if (chkDbDump) chkDbDump.checked = true;
+            if (chkStorage) chkStorage.checked = true;
+            if (chkNginx) chkNginx.checked = true;
+            if (chkWpConfig) chkWpConfig.checked = true;
+        } else if (preset === 'php') {
+            if (chkEnv) chkEnv.checked = true;
+            if (chkSqlite) chkSqlite.checked = true;
+            if (chkDbDump) chkDbDump.checked = true;
+            if (chkStorage) chkStorage.checked = true;
+            if (chkNginx) chkNginx.checked = true;
+            if (chkWpConfig) chkWpConfig.checked = false;
+        } else if (preset === 'static') {
+            if (chkEnv) chkEnv.checked = false;
+            if (chkSqlite) chkSqlite.checked = false;
+            if (chkDbDump) chkDbDump.checked = true;
+            if (chkStorage) chkStorage.checked = false;
+            if (chkNginx) chkNginx.checked = true;
+            if (chkWpConfig) chkWpConfig.checked = false;
+        }
+        updateProtectedCountBadge();
+    };
+
+    window.addCustomProtectPattern = function() {
+        const inp = document.getElementById('txtCustomProtect');
+        if (!inp) return;
+        const val = inp.value.trim().replace(/\\/g, '/').replace(/^\/+/, '');
+        if (val && !customProtectPatterns.includes(val)) {
+            customProtectPatterns.push(val);
+            renderCustomProtectChips();
+            inp.value = '';
+            updateProtectedCountBadge();
+        }
+    };
+
+    window.removeCustomProtectPattern = function(idx) {
+        if (idx >= 0 && idx < customProtectPatterns.length) {
+            customProtectPatterns.splice(idx, 1);
+            renderCustomProtectChips();
+            updateProtectedCountBadge();
+        }
+    };
+
+    function renderCustomProtectChips() {
+        const c = document.getElementById('customProtectChips');
+        if (!c) return;
+        if (customProtectPatterns.length === 0) {
+            c.innerHTML = '<span style="color:#8b949e;font-size:0.76rem">No custom patterns added yet.</span>';
+            return;
+        }
+        c.innerHTML = customProtectPatterns.map((p, idx) => `
+            <span style="background:#1f2937;border:1px solid #374151;color:#a5d6ff;border-radius:4px;padding:2px 8px;font-size:0.75rem;display:inline-flex;align-items:center;gap:6px">
+                <code>${p}</code>
+                <button type="button" onclick="removeCustomProtectPattern(${idx})" style="background:none;border:none;color:#ff7b72;cursor:pointer;padding:0;font-size:0.85rem;line-height:1" title="Remove">&times;</button>
+            </span>
+        `).join('');
+    }
+
+    function parseAndApplyGitignoreRules(txt) {
+        if (!txt) return;
+        const lines = txt.split('\n');
+        const rules = [];
+        lines.forEach(l => {
+            let trimmed = l.trim().replace(/^[ \t]*#.*/, '').replace(/^!/, '');
+            if (!trimmed) return;
+            trimmed = trimmed.replace(/\\/g, '/').replace(/^\/+/, '');
+            if (/(\.env|\.sql|\.sqlite|\.db|storage|config|secret|key|upload)/i.test(trimmed)) {
+                rules.push(trimmed);
+            }
+        });
+        if (rules.length > 0) {
+            discoveredGitignoreRules = Array.from(new Set(rules));
+            const notice = document.getElementById('dropGitignoreNotice');
+            if (notice) {
+                notice.innerHTML = '✅ <b style="color:#7ee787">' + discoveredGitignoreRules.length + '</b> rules identified from <code>.gitignore</code> (' + discoveredGitignoreRules.slice(0, 3).join(', ') + (discoveredGitignoreRules.length > 3 ? '...' : '') + ')';
+            }
+            updateProtectedCountBadge();
+        }
+    }
+
+    window.getActiveProtectedPatterns = function() {
+        const patterns = [];
+        const chkEnv = document.getElementById('chkProtectEnv');
+        const chkSqlite = document.getElementById('chkProtectSqlite');
+        const chkDbDump = document.getElementById('chkProtectDbDump');
+        const chkStorage = document.getElementById('chkProtectStorage');
+        const chkNginx = document.getElementById('chkProtectNginx');
+        const chkWpConfig = document.getElementById('chkProtectWpConfig');
+        const chkGitignore = document.getElementById('chkProtectGitignore');
+
+        if (chkEnv && chkEnv.checked) {
+            patterns.push('.env', '.env.*', '.env.local', '.env.production');
+        }
+        if (chkSqlite && chkSqlite.checked) {
+            patterns.push('database/*.sqlite', 'database/database.sqlite', '*.sqlite', '*.db', 'storage/*.sqlite');
+        }
+        if (chkDbDump && chkDbDump.checked) {
+            patterns.push('.wtc-database.sql', '.wtc-db.sql', '.wtc-db.php');
+        }
+        if (chkStorage && chkStorage.checked) {
+            patterns.push('storage/app/**', 'uploads/**', 'wp-content/uploads/**');
+        }
+        if (chkNginx && chkNginx.checked) {
+            patterns.push('nginx.conf', 'wtc.json', '.htaccess');
+        }
+        if (chkWpConfig && chkWpConfig.checked) {
+            patterns.push('wp-config.php');
+        }
+        if (chkGitignore && chkGitignore.checked && discoveredGitignoreRules.length > 0) {
+            discoveredGitignoreRules.forEach(r => {
+                if (!patterns.includes(r)) patterns.push(r);
+            });
+        }
+        customProtectPatterns.forEach(cp => {
+            if (!patterns.includes(cp)) patterns.push(cp);
+        });
+        return Array.from(new Set(patterns));
+    };
+
+    window.updateProtectedCountBadge = function() {
+        const b = document.getElementById('protectedCountBadge');
+        if (b) {
+            b.textContent = getActiveProtectedPatterns().length;
+        }
+    };
 
     // Seeder file input listener
     const seederInput = document.getElementById('seederFileInput');
@@ -578,8 +881,25 @@ window.WTC_HOST_IP = '<?= $hostIp ?>';
                         renderDetectedStack('react', normalizedList.map(x => x.path));
                     }
                 }).catch(() => {});
-            } catch(_) {}
+            } catch (_) {}
         }
+
+        // Check for .gitignore or .wtcignore to automatically protect ignored config files
+        const gitignoreItem = normalizedList.find(x => {
+            const p = (x.path || '').toLowerCase().replace(/\\/g, '/');
+            return p === '.gitignore' || p.endsWith('/.gitignore') || p === '.wtcignore' || p.endsWith('/.wtcignore');
+        });
+        if (gitignoreItem && gitignoreItem.file) {
+            try {
+                gitignoreItem.file.text().then(txt => {
+                    parseAndApplyGitignoreRules(txt);
+                }).catch(() => {});
+            } catch (_) {}
+        }
+
+        applyProtectPreset(detectedStackId);
+        const protPanel = document.getElementById('protectedFilesPanel');
+        if (protPanel) protPanel.style.display = 'block';
 
         renderDetectedStack(detectedStackId, normalizedList.map(x => x.path));
 
@@ -590,6 +910,15 @@ window.WTC_HOST_IP = '<?= $hostIp ?>';
         btnDeploy.style.display = 'inline-block';
         const btnManage = document.getElementById('btnManageFolders');
         if (btnManage) btnManage.style.display = 'inline-block';
+
+        // If auto-update is enabled and the site is an existing installed application, auto-apply default exclusions and deploy immediately
+        const autoUpdateEl = document.getElementById('dropAutoUpdate');
+        const isKnownSite = Array.isArray(window.WTC_EXISTING_SITES) && window.WTC_EXISTING_SITES.includes(siteInput.value);
+        if (autoUpdateEl && autoUpdateEl.checked && isKnownSite) {
+            applyDefaultFolderFilters();
+            submitStagedFiles();
+            return;
+        }
 
         // Open modal showing file count and allowing user to choose what folders NOT to upload
         openFolderExclusionModal();
@@ -1049,18 +1378,22 @@ window.WTC_HOST_IP = '<?= $hostIp ?>';
     }
 
     window.syncDbCheckboxes = function(source) {
-        const modalMigrate = document.getElementById('modalChkMigrate');
-        const modalSeed = document.getElementById('modalChkSeed');
-        const envMigrate = document.getElementById('envChkMigrate');
-        const envSeed = document.getElementById('envChkSeed');
-
-        if (source === 'modal') {
-            if (envMigrate && modalMigrate) envMigrate.checked = modalMigrate.checked;
-            if (envSeed && modalSeed) envSeed.checked = modalSeed.checked;
-        } else {
-            if (modalMigrate && envMigrate) modalMigrate.checked = envMigrate.checked;
-            if (modalSeed && envSeed) modalSeed.checked = envSeed.checked;
-        }
+        const pairs = [
+            ['modalChkRouteClear', 'envChkRouteClear'],
+            ['modalChkOptimizeClear', 'envChkOptimizeClear'],
+            ['modalChkMigrate', 'envChkMigrate'],
+            ['modalChkSeed', 'envChkSeed'],
+            ['modalChkStorageLink', 'envChkStorageLink']
+        ];
+        pairs.forEach(([mId, eId]) => {
+            const m = document.getElementById(mId);
+            const e = document.getElementById(eId);
+            if (source === 'modal') {
+                if (e && m) e.checked = m.checked;
+            } else {
+                if (m && e) m.checked = e.checked;
+            }
+        });
     };
 
     function renderRequirements(profile) {
@@ -1334,6 +1667,20 @@ REDIS_PORT=6379`;
         return new Blob(allParts, { type: 'application/zip' });
     }
 
+    function appendArtisanPreferences(fd) {
+        const runRouteClear = (document.getElementById('modalChkRouteClear')?.checked ?? document.getElementById('envChkRouteClear')?.checked);
+        const runOptimizeClear = (document.getElementById('modalChkOptimizeClear')?.checked ?? document.getElementById('envChkOptimizeClear')?.checked);
+        const runStorageLink = (document.getElementById('modalChkStorageLink')?.checked ?? document.getElementById('envChkStorageLink')?.checked);
+        const runMigrate = (document.getElementById('modalChkMigrate')?.checked ?? document.getElementById('envChkMigrate')?.checked);
+        const runSeed = (document.getElementById('modalChkSeed')?.checked ?? document.getElementById('envChkSeed')?.checked);
+
+        if (runRouteClear !== undefined) fd.append('run_route_clear', runRouteClear ? '1' : '0');
+        if (runOptimizeClear !== undefined) fd.append('run_optimize_clear', runOptimizeClear ? '1' : '0');
+        if (runStorageLink !== undefined) fd.append('run_storage_link', runStorageLink ? '1' : '0');
+        if (runMigrate) fd.append('run_migrations', '1');
+        if (runSeed) fd.append('run_seeds', '1');
+    }
+
     window.submitStagedFiles = async function() {
         const filesToUpload = getFilteredStagedFiles();
         if (filesToUpload.length === 0) {
@@ -1356,16 +1703,16 @@ REDIS_PORT=6379`;
         fd.append('site', siteName);
         if (envContent) fd.append('env_content', envContent);
 
-        // Attach Laravel migration & seed preferences
-        const runMigrate = (document.getElementById('modalChkMigrate')?.checked || document.getElementById('envChkMigrate')?.checked);
-        const runSeed = (document.getElementById('modalChkSeed')?.checked || document.getElementById('envChkSeed')?.checked);
-        if (runMigrate) fd.append('run_migrations', '1');
-        if (runSeed) fd.append('run_seeds', '1');
+        // Attach Laravel migration, cache & seed preferences
+        appendArtisanPreferences(fd);
 
         // Attach staged database seeder if present
         if (stagedSeederFile) {
             fd.append('seeder_file', stagedSeederFile);
         }
+
+        // Attach protected patterns to prevent overwriting server configs
+        fd.append('protected_patterns', JSON.stringify(getActiveProtectedPatterns()));
 
         // Try in-memory browser zip packaging for 1-file direct RAM streaming
         let packagedAsZip = false;
@@ -1390,17 +1737,83 @@ REDIS_PORT=6379`;
         sendUpload(fd);
     };
 
-    function uploadSingleArchive(file) {
-        const siteName = (siteInput.value || file.name.replace(/(\.tar\.gz|\.tgz|\.tar|\.zip)$/i, '')).toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+    function uploadSingleArchive(file, targetSiteName = null, forceSpinUp = null, customPatterns = null, isPrimary = null) {
+        const siteName = (targetSiteName || siteInput.value || file.name.replace(/(\.tar\.gz|\.tgz|\.tar|\.zip)$/i, '')).toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+        const shouldSpin = forceSpinUp !== null ? forceSpinUp : spinCheck.checked;
+        const prot = (customPatterns && customPatterns.length > 0) ? customPatterns : getActiveProtectedPatterns();
+
         const fd = new FormData();
         fd.append('csrf', csrfToken);
         fd.append('action', 'drop_upload');
         fd.append('is_ajax', '1');
-        fd.append('spin_up', spinCheck.checked ? '1' : '0');
+        fd.append('spin_up', shouldSpin ? '1' : '0');
+        if (isPrimary !== null) {
+            fd.append('primary', isPrimary ? '1' : '0');
+        }
         fd.append('site', siteName);
         fd.append('archive', file);
+        fd.append('protected_patterns', JSON.stringify(prot));
+        appendArtisanPreferences(fd);
 
-        showProgress('🚀 Streaming archive directly into Pi RAM tmpfs...', 30);
+        showProgress(`🚀 Streaming archive to auto-update '${siteName}' in RAM tmpfs...`, 30);
+        sendUpload(fd);
+    }
+
+    async function uploadFolderForSite(filesWithPaths, targetSiteName, forceSpinUp = true, customPatterns = null, isPrimary = null) {
+        const siteName = (targetSiteName || siteInput.value || 'site-' + Date.now()).toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+        siteInput.value = siteName;
+        detectedStackId = detectStackFromPaths(filesWithPaths.map(x => x.path));
+
+        const gitignoreItem = filesWithPaths.find(x => {
+            const p = (x.path || '').toLowerCase().replace(/\\/g, '/');
+            return p === '.gitignore' || p.endsWith('/.gitignore') || p === '.wtcignore' || p.endsWith('/.wtcignore');
+        });
+        if (gitignoreItem && gitignoreItem.file) {
+            try {
+                const txt = await gitignoreItem.file.text();
+                parseAndApplyGitignoreRules(txt);
+            } catch (_) {}
+        }
+
+        const filtered = filesWithPaths.filter(item => {
+            const rel = item.path.replace(/\\/g, '/').replace(/^\/+/, '');
+            const top = rel.split('/')[0].toLowerCase();
+            return !['vendor', 'node_modules', '.git', '.github', 'storage'].includes(top);
+        });
+        const uploadList = filtered.length > 0 ? filtered : filesWithPaths;
+        const prot = (customPatterns && customPatterns.length > 0) ? customPatterns : getActiveProtectedPatterns();
+
+        const fd = new FormData();
+        fd.append('csrf', csrfToken);
+        fd.append('action', 'drop_upload');
+        fd.append('is_ajax', '1');
+        fd.append('spin_up', forceSpinUp ? '1' : '0');
+        if (isPrimary !== null) {
+            fd.append('primary', isPrimary ? '1' : '0');
+        }
+        fd.append('detected_stack', detectedStackId);
+        fd.append('deploy_mode', 'standard');
+        fd.append('site', siteName);
+        fd.append('protected_patterns', JSON.stringify(prot));
+        appendArtisanPreferences(fd);
+
+        try {
+            showProgress('📦 Packaging ' + uploadList.length + ' files in browser memory...', 10);
+            const zipBlob = await createZipFromFiles(uploadList, (cur, total) => {
+                const pct = Math.round((cur / total) * 30);
+                showProgress(`📦 Bundling files in memory: ${cur} / ${total}`, pct);
+            });
+            const zipFile = new File([zipBlob], siteName + '.zip', { type: 'application/zip' });
+            fd.append('archive', zipFile);
+        } catch (packErr) {
+            console.warn('In-browser zip packing failed, falling back to multipart:', packErr);
+            uploadList.forEach(item => {
+                fd.append('files[]', item.file);
+                fd.append('paths[]', item.path);
+            });
+        }
+
+        showProgress(`🚀 Streaming to auto-update '${siteName}' directly in RAM disk...`, 35);
         sendUpload(fd);
     }
 
@@ -1459,10 +1872,17 @@ REDIS_PORT=6379`;
                                 </div>
                             ` : '';
 
+                            const restoredHtml = (res.restored_files && res.restored_files.length > 0) ? `
+                                <div style="background:#0e1d15;border:1px solid #238636;border-radius:6px;padding:8px 12px;margin:10px 0;text-align:left;font-size:0.82rem;color:#7ee787">
+                                    🛡️ <b>Protected Working Configurations Retained:</b> ${res.restored_files.join(', ')}
+                                </div>
+                            ` : '';
+
                             resultBox.innerHTML = `
                                 <div class="success-banner">
                                     <h4>🎉 Success! Site '<b>${res.site}</b>' ${res.spun_up ? 'is LIVE in RAM!' : 'provisioned into sites repository!'}</h4>
                                     <p>${res.spun_up ? '🚀 Your application is live and running directly from RAM tmpfs storage.' : 'Site package saved to /opt/wtc-web/sites and ready to deploy.'}</p>
+                                    ${restoredHtml}
                                     ${dbHtml}
                                     ${artisanHtml}
                                     <div class="success-actions">
@@ -1531,5 +1951,17 @@ REDIS_PORT=6379`;
             if (e.target === modalEl) closeFolderExclusionModal();
         });
     }
+
+    window.wtcDropzone = {
+        uploadSingleArchive,
+        uploadFolderForSite,
+        readDirectoryRecursive,
+        createZipFromFiles,
+        showProgress,
+        getActiveProtectedPatterns,
+        STACK_PROTECT_PRESETS,
+        applyProtectPreset,
+        parseAndApplyGitignoreRules
+    };
 })();
 </script>

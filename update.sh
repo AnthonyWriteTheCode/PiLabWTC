@@ -18,6 +18,7 @@ install -m 0644 "$SRC/wtc-common.sh"       /usr/local/lib/wtc-web/common.sh
 install -m 0755 "$SRC/03-site-service.sh"  /usr/local/bin/wtc-site-service
 install -m 0755 "$SRC/02-manage-site.sh"   /usr/local/bin/wtc-manage
 install -m 0755 "$SRC/wtc-workers"         /usr/local/bin/wtc-workers
+install -m 0755 "$SRC/wtc-network"         /usr/local/bin/wtc-network
 
 # 2. Update UI files
 echo "==> Updating Web Management UI in /opt/wtc-web/ui"
@@ -65,7 +66,7 @@ php_admin_value[max_input_time] = 600
 php_admin_value[memory_limit] = 512M
 php_admin_value[max_file_uploads] = 10000
 php_admin_value[max_input_vars] = 50000
-php_admin_value[open_basedir] = /opt/wtc-web/ui:/mnt/ramdisk/ui:/opt/wtc-web/sites:/mnt/ramdisk:/var/lib/wtc-web/sessions:/etc/wtc-web/ui-auth:/etc/nginx:/tmp
+php_admin_value[open_basedir] = /opt/wtc-web:/mnt/ramdisk:/var/lib/wtc-web:/etc/wtc-web:/etc/nginx:/etc/php:/etc/os-release:/tmp
 EOF
 
 # Ensure wtc-site pool exists with dedicated multi-worker processes
@@ -376,8 +377,76 @@ systemctl daemon-reload
 systemctl enable wtc-workers.service
 systemctl restart wtc-workers.service || true
 
-# 6. Tune PHP-FPM, open_basedir, timeouts, and reload services
+# 6. Install systemd unit and power management for Network Watchdog
+echo "==> Configuring Network Resilience, Auto-Reconnect & Watchdog Service"
+install -d /etc/NetworkManager/conf.d /etc/udev/rules.d
+cat > /etc/NetworkManager/conf.d/default-wifi-powersave-disable.conf <<'EOF'
+[connection]
+wifi.powersave = 2
+EOF
+
+cat > /etc/udev/rules.d/70-wifi-powersave.rules <<'EOF'
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="wl*|wlan*", RUN+="/usr/bin/iw dev %k set power_save off"
+EOF
+
+cat > /etc/systemd/system/wtc-network.service <<'EOF'
+[Unit]
+Description=WTC Network Resilience, Auto-Reconnect & Fan Watchdog
+After=local-fs.target
+Wants=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/wtc-network daemon
+Restart=always
+RestartSec=5s
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+install -d /etc/systemd/system/nginx.service.d
+cat > /etc/systemd/system/nginx.service.d/wtc.conf <<'EOF'
+[Unit]
+Requires=wtc-ramdisk.service
+After=wtc-ramdisk.service network.target
+EOF
+
+systemctl daemon-reload
+systemctl enable wtc-network.service
+systemctl restart wtc-network.service || true
+
+echo "==> Optimizing boot performance & eliminating wait-online stalls"
+# Disable wait-online services that stall boot for 60-120s if Wi-Fi associates slowly or Ethernet is unplugged
+systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+systemctl mask NetworkManager-wait-online.service 2>/dev/null || true
+systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
+systemctl mask systemd-networkd-wait-online.service 2>/dev/null || true
+
+# Disable unused Bluetooth UART initialization (saves 15-25s on Pi boot)
+systemctl disable hciuart.service 2>/dev/null || true
+systemctl disable bluetooth.service 2>/dev/null || true
+
+# Disable cloud-init if installed (common on Ubuntu Server Pi images; saves 30-60s)
+if [ -d /etc/cloud ]; then
+  touch /etc/cloud/cloud-init.disabled 2>/dev/null || true
+  systemctl disable cloud-init.service cloud-init-local.service cloud-config.service cloud-final.service 2>/dev/null || true
+fi
+
+# 7. Tune PHP-FPM, open_basedir, timeouts, MariaDB loopback isolation, and reload services
 echo "==> Applying server optimizations and reloading services"
+mkdir -p /etc/mysql/mariadb.conf.d /etc/mysql/conf.d 2>/dev/null || true
+cat > /etc/mysql/mariadb.conf.d/99-wtc-bind.cnf <<'EOF'
+[mysqld]
+bind-address = 127.0.0.1
+EOF
+chmod 0644 /etc/mysql/mariadb.conf.d/99-wtc-bind.cnf 2>/dev/null || true
+[ -d /etc/mysql/conf.d ] && cp -f /etc/mysql/mariadb.conf.d/99-wtc-bind.cnf /etc/mysql/conf.d/99-wtc-bind.cnf 2>/dev/null || true
+systemctl restart mariadb 2>/dev/null || systemctl restart mysql 2>/dev/null || true
 /usr/local/bin/wtc-manage --server-tune
 /usr/local/bin/wtc-manage --reload-ui
 /usr/local/bin/wtc-manage --rescan-stack >/dev/null 2>&1 || true
@@ -387,13 +456,25 @@ echo "==> Applying server optimizations and reloading services"
 echo "==> Available Sites in Repository:"
 /usr/local/bin/wtc-manage --list || true
 
-# 7. Ensure avahi-daemon (mDNS / .local hostname browsing) is installed & running
+# 7. Ensure avahi-daemon (mDNS / .local hostname browsing) and unattended-upgrades are installed & running
+if ! command -v pigz >/dev/null 2>&1; then
+  echo "==> Installing pigz for multi-core archive extraction"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y pigz 2>/dev/null || true
+fi
+
 if ! command -v avahi-daemon >/dev/null 2>&1; then
   echo "==> Installing avahi-daemon for .local hostname resolution"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq && apt-get install -y avahi-daemon || true
 fi
 systemctl enable --now avahi-daemon 2>/dev/null || true
+
+if ! dpkg -s unattended-upgrades >/dev/null 2>&1; then
+  echo "==> Installing unattended-upgrades for automated security patches"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y unattended-upgrades || true
+fi
 
 HOST="$(hostname)"
 IP="$(hostname -I | awk '{print $1}')"

@@ -74,11 +74,13 @@ flowchart TB
 |---|---|---|---|
 | **Live Web Server** | `http://<pi>/` (Port 80 & 8080) | Serves the primary active website directly at root (`/mnt/ramdisk/webroot`). | **RAM Disk** (`tmpfs`) |
 | **Management Utility** | `http://<pi>:4485/` | Dedicated administration console: swap sites, stack installer, file transfer settings, save state. Runs on single worker process. | **RAM Disk** (`/mnt/ramdisk/ui`, synced from `/opt/wtc-web/ui`) |
+| **Dashboard Live Engine** | `/?action=dash_live` / `dash-live.js` | Single-worker friendly unified live telemetry poller (3s) with in-browser sparklines, dynamic alerts, and lazy-loaded diagnostics. | Process / RAM (in-memory + sessionStorage) |
 | **MariaDB 10.x** | Local Socket / 3306 | Dedicated database engine with automatic per-site user & DB provisioning (`w_<site>`). | **Persistent** (`/var/lib/mysql`) |
 | **Dropbox Ingest** | `\\<pi>\dropbox` or `/mnt/ramdisk/dropbox` | Drop any `<site>.tar.gz` to automatically create or update swappable sites. | **RAM Ingest** $\rightarrow$ **SD Storage** |
 | **PHP-FPM [wtc-site]** | `/run/php/wtc-site.sock` | Dedicated multi-worker dynamic pool for live web applications. | Process / RAM |
 | **PHP-FPM [wtc-ui]** | `/run/php/wtc-ui.sock` | Dedicated single-worker static pool (1 thread) for the management UI. | Process / RAM |
 | **Save State** | CLI `--save-state` / UI button | Snapshots live RAM site modifications (uploads, data) back to the SD archive. | RAM $\rightarrow$ SD Archive |
+| **Service Manager** | Web UI Tab (`/?p=services`) | Inspects & controls systemd daemons. Clearly separates platform/stack services belonging to us from Linux kernel/OS system services. | Web UI / `systemctl` |
 | **Terminal CLI** | `sudo wtc-manage` | Whiptail-driven terminal menu and command-line management tool. | System binary |
 
 ---

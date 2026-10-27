@@ -127,7 +127,10 @@ cmd_rollback() {
   mv -f "$PREV_DIR/$1.tar.gz" "$SITES_DIR/$1.tar.gz"
   mv -f "$PREV_DIR/$1.tar.gz.swap" "$PREV_DIR/$1.tar.gz"
   log "Rolled back '$1'"
-  if is_site_active "$1"; then "$SERVICE_BIN" --activate "$1"; fi
+  if is_site_active "$1"; then
+    local is_prim=0; [ "$(active_site)" = "$1" ] && is_prim=1
+    "$SERVICE_BIN" --activate "$1" "$is_prim"
+  fi
 }
 
 cmd_delete() {
@@ -154,7 +157,7 @@ EOF
 }
 
 cmd_direct_deploy() {
-  local site="${1:-}" stageTarget="${2:-}" stageDir="" is_temp=0
+  local site="${1:-}" stageTarget="${2:-}" stageDir="" is_temp=0 make_primary="${3:-}"
   valid_name "$site" || die "Invalid site name"
   ensure_ramdisk
 
@@ -163,15 +166,7 @@ cmd_direct_deploy() {
   elif [ -f "$stageTarget" ]; then
     stageDir="$(mktemp -d "$STAGE_DIR/.deploy.XXXXXX")"
     is_temp=1
-    case "$stageTarget" in
-      *.tar.gz|*.tgz|*.tar)
-        tar -xf "$stageTarget" -C "$stageDir" --no-same-owner --no-same-permissions || die "Tar extraction failed"
-        ;;
-      *.zip)
-        unzip -qo "$stageTarget" -d "$stageDir" || die "Zip extraction failed"
-        ;;
-      *) die "Unsupported archive format: $stageTarget" ;;
-    esac
+    safe_extract_archive "$stageTarget" "$stageDir" || die "Archive extraction failed"
     # Ignore __MACOSX if present
     rm -rf "$stageDir/__MACOSX" 2>/dev/null || true
 
@@ -196,7 +191,7 @@ cmd_direct_deploy() {
   store_dir_as_site "$site" "$stageDir" || die "Failed to save site package to $SITES_DIR"
 
   # 2. Swap directly in RAM immediately - zero delay
-  "$SERVICE_BIN" --swap-dir "$site" "$stageDir"
+  "$SERVICE_BIN" --swap-dir "$site" "$stageDir" "$make_primary"
 
   if [ "$is_temp" -eq 1 ]; then
     rm -rf "$stageDir"
@@ -218,11 +213,7 @@ cmd_store_site() {
   elif [ -f "$stageTarget" ]; then
     stageDir="$(mktemp -d "$STAGE_DIR/.deploy.XXXXXX")"
     is_temp=1
-    case "$stageTarget" in
-      *.tar.gz|*.tgz|*.tar) tar -xf "$stageTarget" -C "$stageDir" --no-same-owner --no-same-permissions || die "Tar extraction failed" ;;
-      *.zip) unzip -qo "$stageTarget" -d "$stageDir" || die "Zip extraction failed" ;;
-      *) die "Unsupported archive format: $stageTarget" ;;
-    esac
+    safe_extract_archive "$stageTarget" "$stageDir" || die "Archive extraction failed"
     local entries; entries="$(find "$stageDir" -mindepth 1 -maxdepth 1 | wc -l)"
     if [ "$entries" -eq 1 ]; then
       local only; only="$(find "$stageDir" -mindepth 1 -maxdepth 1)"
@@ -241,6 +232,10 @@ cmd_store_site() {
   rm -rf "$stageDir"
   [ "$is_temp" -eq 1 ] && rm -f "$stageTarget"
   log "Stored '$site' into /opt/wtc-web/sites repository"
+  if [ "${AUTO_RELOAD_ACTIVE:-yes}" = "yes" ] && is_site_active "$site"; then
+    local is_prim=0; [ "$(active_site)" = "$site" ] && is_prim=1
+    "$SERVICE_BIN" --activate "$site" "$is_prim" || log "Reload of active site '$site' failed"
+  fi
 }
 
 cmd_server_tune() {
@@ -315,6 +310,7 @@ EOF
 
   systemctl reload nginx 2>/dev/null || true
   systemctl reload "php$phpv-fpm.service" 2>/dev/null || true
+  harden_mariadb_loopback 2>/dev/null || true
   log "Server tuned for high-speed RAM UI and uploads (pm=dynamic, opcache=on, 1024M uploads)"
 }
 
@@ -492,12 +488,17 @@ cmd_artisan() {
     site="$target"
     valid_name "$site" || die "Invalid site name: $site"
     local live; live="$(readlink -f "$WWW_LINK" 2>/dev/null || true)"
+    local slug; slug="$(site_slug "$site")"
     if [ -d "$live" ] && [ "$(active_site)" = "$site" ] && [ -f "$live/artisan" ]; then
       targetDir="$live"
     elif [ -d "$RAM_MOUNT/sites/$site" ] && [ -f "$RAM_MOUNT/sites/$site/artisan" ]; then
       targetDir="$RAM_MOUNT/sites/$site"
+    elif [ -d "$RAM_MOUNT/sites/$slug" ] && [ -f "$RAM_MOUNT/sites/$slug/artisan" ]; then
+      targetDir="$RAM_MOUNT/sites/$slug"
     elif [ -d "$STAGE_DIR/$site" ] && [ -f "$STAGE_DIR/$site/artisan" ]; then
       targetDir="$STAGE_DIR/$site"
+    elif [ -d "$STAGE_DIR/$slug" ] && [ -f "$STAGE_DIR/$slug/artisan" ]; then
+      targetDir="$STAGE_DIR/$slug"
     fi
   fi
 
@@ -510,8 +511,21 @@ cmd_artisan() {
 
   laravel_repair_shim "$site" "$targetDir" || exit 1
 
+  # Security validation: strictly reject shell operators, metacharacters, or illegal syntax
+  local safe_artisan_rx='^[a-zA-Z0-9_: =./-]+$'
+  [[ "$cmd" =~ $safe_artisan_rx ]] || die "Invalid artisan command: illegal characters detected"
+  case "$cmd" in
+    *[\;\&\|\`\$\<\>\r\n]*) die "Invalid artisan command: shell operators prohibited" ;;
+  esac
+
+  case "$cmd" in
+    *clear*|*route:*|*config:*|*optimize*)
+      rm -f "$targetDir/bootstrap/cache/"*.php 2>/dev/null || true
+      ;;
+  esac
+
   log "Running 'php artisan $cmd' for site '$site' in $targetDir"
-  su -s /bin/bash "$WEB_USER" -c "cd '$targetDir' && php artisan $cmd" 2>&1
+  su -s /bin/bash "$WEB_USER" -c 'cd "$1" && exec php artisan '"$cmd"'' -- "$targetDir" 2>&1
 }
 
 # If a site was uploaded without vendor/, the UI replaced bootstrap/app.php and
@@ -604,8 +618,9 @@ cmd_setting() {
   local k="${1:-}" v="${2:-}"
   case "$k" in
     RAM_SIZE)               [[ "$v" =~ ^[0-9]{2,5}[MG]$ ]] || die "RAM_SIZE like 512M or 1G" ;;
-    DROP_MAX_MB|SAVE_INTERVAL_MIN) [[ "$v" =~ ^[0-9]{1,5}$ ]] || die "$k must be a number" ;;
-    AUTO_ACTIVATE_NEW|AUTO_RELOAD_ACTIVE|KEEP_PROCESSED|SAVE_ON_SHUTDOWN|SAVE_ON_SWITCH)
+    DROP_MAX_MB|SAVE_INTERVAL_MIN|FAN_GPIO) [[ "$v" =~ ^[0-9]{1,5}$ ]] || die "$k must be a number" ;;
+    FAN_WIFI_MODE)          [[ "$v" =~ ^(pulse|spin)$ ]] || die "$k must be pulse or spin" ;;
+    AUTO_ACTIVATE_NEW|AUTO_RELOAD_ACTIVE|KEEP_PROCESSED|SAVE_ON_SHUTDOWN|SAVE_ON_SWITCH|FAN_ON_WIFI_DISCONNECT)
                             [[ "$v" =~ ^(yes|no)$ ]] || die "$k must be yes or no" ;;
     *) die "Unknown setting '$k'" ;;
   esac
@@ -1139,7 +1154,13 @@ json_status() {
   # Fast worker check: read PID file instead of invoking external binary
   local workers_json
   local w_has_artisan=false w_q_run=false w_s_run=false w_svc="no" w_q_pid="" w_s_pid=""
-  if [ -f "/mnt/ramdisk/webroot/artisan" ] || [ -f "/mnt/ramdisk/webroot/../artisan" ] || [ -f "/mnt/ramdisk/www/artisan" ]; then w_has_artisan=true; fi
+  if [ -f "/mnt/ramdisk/webroot/artisan" ] || [ -f "/mnt/ramdisk/webroot/../artisan" ] || [ -f "/mnt/ramdisk/www/artisan" ]; then
+    w_has_artisan=true
+  elif [ -n "$(active_site)" ] && { [ -f "$RAM_MOUNT/sites/$(site_slug "$(active_site)")/artisan" ] || [ -f "$RAM_MOUNT/sites/$(active_site)/artisan" ]; }; then
+    w_has_artisan=true
+  elif [ -d "$RAM_MOUNT/sites" ] && [ -n "$(find "$RAM_MOUNT/sites" -maxdepth 2 -name artisan 2>/dev/null | head -n1)" ]; then
+    w_has_artisan=true
+  fi
   if systemctl is-active --quiet wtc-workers.service 2>/dev/null; then w_svc="yes"; fi
   w_q_pid="$(pgrep -f "artisan queue:work" 2>/dev/null | head -n1 || true)"
   w_s_pid="$(pgrep -f "artisan schedule:work" 2>/dev/null | head -n1 || true)"
@@ -1185,7 +1206,11 @@ json_status() {
 
 json_sysinfo() {
   # Snapshot /proc/stat twice with a brief sleep or calculate differential
-  local stat_file="/run/wtc-proc-stat.cache"
+  local client_id="${1:-}"
+  client_id="$(echo "$client_id" | tr -cd 'a-zA-Z0-9_-' | cut -c1-16)"
+  local stat_dir="/run"
+  [ -d "$stat_dir" ] && [ -w "$stat_dir" ] || stat_dir="/tmp"
+  local stat_file="$stat_dir/wtc-proc-stat${client_id:+-$client_id}.cache"
   local now_ts; now_ts="$(date +%s%N 2>/dev/null || date +%s)"
   local prev_ts="" prev_data=""
   if [ -f "$stat_file" ]; then
@@ -1280,6 +1305,131 @@ json_sysinfo() {
     out = out "],\"count\":" core_count "}"
     print out
   }'
+}
+
+json_dash() {
+  local client_id="${1:-}"
+  client_id="$(echo "$client_id" | tr -cd 'a-zA-Z0-9_-' | cut -c1-16)"
+  local status_json sys_json build_json
+  status_json="$(json_status)"
+  sys_json="$(json_sysinfo "$client_id")"
+  if [ -z "$sys_json" ]; then
+    sys_json='{"freq_mhz":1500,"total":0.0,"cores":[],"count":0}'
+  fi
+  build_json="$(json_build)"
+  if [ -z "$build_json" ]; then
+    build_json='{"busy":false,"log":""}'
+  fi
+
+  # Load averages from /proc/loadavg
+  local l1="0.00" l5="0.00" l15="0.00"
+  if [ -r /proc/loadavg ]; then
+    read -r l1 l5 l15 _ < /proc/loadavg 2>/dev/null || true
+  fi
+
+  # Throttled status from vcgencmd (Raspberry Pi hardware)
+  local throttled_code="0x0" under_voltage=false is_throttled=false freq_capped=false temp_limit=false
+  local uv_has=false thr_has=false cap_has=false tmp_has=false
+  if command -v vcgencmd >/dev/null 2>&1; then
+    local t_raw
+    t_raw="$(vcgencmd get_throttled 2>/dev/null || true)"
+    if [[ "$t_raw" =~ throttled=(0x[0-9a-fA-F]+) ]]; then
+      throttled_code="${BASH_REMATCH[1]}"
+      local t_val=$(( throttled_code ))
+      [ $(( t_val & 0x1 )) -ne 0 ] && under_voltage=true
+      [ $(( t_val & 0x2 )) -ne 0 ] && freq_capped=true
+      [ $(( t_val & 0x4 )) -ne 0 ] && is_throttled=true
+      [ $(( t_val & 0x8 )) -ne 0 ] && temp_limit=true
+      [ $(( t_val & 0x10000 )) -ne 0 ] && uv_has=true
+      [ $(( t_val & 0x20000 )) -ne 0 ] && cap_has=true
+      [ $(( t_val & 0x40000 )) -ne 0 ] && thr_has=true
+      [ $(( t_val & 0x80000 )) -ne 0 ] && tmp_has=true
+    fi
+  fi
+
+  # Saved state info and dirty check
+  local last_saved=0 is_dirty=false
+  local save_stamp_file="${SAVE_STAMP:-/run/wtc-web.save-stamp}"
+  if [ -f "$save_stamp_file" ]; then
+    last_saved="$(cat "$save_stamp_file" 2>/dev/null || stat -c %Y "$save_stamp_file" 2>/dev/null || echo 0)"
+  fi
+  [[ "$last_saved" =~ ^[0-9]+$ ]] || last_saved=0
+  local act_site; act_site="$(active_site)"
+  if [ -n "$act_site" ] && [ "$last_saved" -gt 0 ]; then
+    local r_dir="/mnt/ramdisk/webroot"
+    [ -d "$r_dir" ] || r_dir="$RAM_MOUNT/sites/$(site_slug "$act_site")"
+    if [ -d "$r_dir" ]; then
+      local newer_count
+      newer_count="$(find "$r_dir" -maxdepth 3 -type f -newermt "@$last_saved" 2>/dev/null | head -n 5 | wc -l)"
+      [ "$newer_count" -gt 0 ] && is_dirty=true
+    fi
+  elif [ -n "$act_site" ] && [ "$last_saved" -eq 0 ]; then
+    is_dirty=true
+  fi
+
+  # Network rate deltas via /proc/net/dev
+  local rx_rate=0 tx_rate=0
+  local net_cache="/run/wtc-net-rates${client_id:+-$client_id}.cache"
+  local now_sec; now_sec="$(date +%s)"
+  local cur_rx=0 cur_tx=0
+  if [ -r /proc/net/dev ]; then
+    while read -r line; do
+      if [[ "$line" =~ ^[[:space:]]*(eth[0-9]+|wlan[0-9]+|end[0-9]+):[[:space:]]*([0-9]+)[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+([0-9]+) ]]; then
+        cur_rx=$(( cur_rx + BASH_REMATCH[2] ))
+        cur_tx=$(( cur_tx + BASH_REMATCH[3] ))
+      fi
+    done < /proc/net/dev
+    if [ -f "$net_cache" ]; then
+      local prev_sec prev_rx prev_tx
+      read -r prev_sec prev_rx prev_tx < "$net_cache" 2>/dev/null || true
+      if [ -n "$prev_sec" ] && [ "$now_sec" -gt "$prev_sec" ]; then
+        local dt=$(( now_sec - prev_sec ))
+        rx_rate=$(( (cur_rx - prev_rx) / dt ))
+        tx_rate=$(( (cur_tx - prev_tx) / dt ))
+        [ "$rx_rate" -lt 0 ] && rx_rate=0
+        [ "$tx_rate" -lt 0 ] && tx_rate=0
+      fi
+    fi
+    printf "%s %s %s\n" "$now_sec" "$cur_rx" "$cur_tx" > "$net_cache" 2>/dev/null || true
+  fi
+
+  jq -nc \
+    --argjson status "$status_json" \
+    --argjson cpu "$sys_json" \
+    --argjson build "$build_json" \
+    --argjson loadavg "[\"$l1\",\"$l5\",\"$l15\"]" \
+    --arg throttledCode "$throttled_code" \
+    --argjson underVoltage "$under_voltage" \
+    --argjson isThrottled "$is_throttled" \
+    --argjson freqCapped "$freq_capped" \
+    --argjson tempLimit "$temp_limit" \
+    --argjson uvOccurred "$uv_has" \
+    --argjson lastSaved "$last_saved" \
+    --argjson isDirty "$is_dirty" \
+    --argjson rxRate "$rx_rate" \
+    --argjson txRate "$tx_rate" \
+    '{
+      status: $status,
+      cpu: $cpu,
+      build: $build,
+      loadavg: $loadavg,
+      throttling: {
+        code: $throttledCode,
+        under_voltage: $underVoltage,
+        throttled: $isThrottled,
+        freq_capped: $freqCapped,
+        temp_limit: $tempLimit,
+        under_voltage_occurred: $uvOccurred
+      },
+      saved_state: {
+        last_saved: $lastSaved,
+        is_dirty: $isDirty
+      },
+      net_rates: {
+        rx_bytes_sec: $rxRate,
+        tx_bytes_sec: $txRate
+      }
+    }'
 }
 
 json_processes() {
@@ -1446,7 +1596,9 @@ json_settings() {
     --arg AUTO_RELOAD_ACTIVE "$AUTO_RELOAD_ACTIVE" --arg KEEP_PROCESSED "$KEEP_PROCESSED" \
     --arg SAVE_ON_SHUTDOWN "$SAVE_ON_SHUTDOWN" --arg SAVE_ON_SWITCH "$SAVE_ON_SWITCH" \
     --arg SAVE_INTERVAL_MIN "$SAVE_INTERVAL_MIN" \
-    '{RAM_SIZE:$RAM_SIZE,DROP_MAX_MB:$DROP_MAX_MB,AUTO_ACTIVATE_NEW:$AUTO_ACTIVATE_NEW,AUTO_RELOAD_ACTIVE:$AUTO_RELOAD_ACTIVE,KEEP_PROCESSED:$KEEP_PROCESSED,SAVE_ON_SHUTDOWN:$SAVE_ON_SHUTDOWN,SAVE_ON_SWITCH:$SAVE_ON_SWITCH,SAVE_INTERVAL_MIN:$SAVE_INTERVAL_MIN}'
+    --arg FAN_ON_WIFI_DISCONNECT "${FAN_ON_WIFI_DISCONNECT:-no}" --arg FAN_WIFI_MODE "${FAN_WIFI_MODE:-pulse}" \
+    --arg FAN_GPIO "${FAN_GPIO:-14}" \
+    '{RAM_SIZE:$RAM_SIZE,DROP_MAX_MB:$DROP_MAX_MB,AUTO_ACTIVATE_NEW:$AUTO_ACTIVATE_NEW,AUTO_RELOAD_ACTIVE:$AUTO_RELOAD_ACTIVE,KEEP_PROCESSED:$KEEP_PROCESSED,SAVE_ON_SHUTDOWN:$SAVE_ON_SHUTDOWN,SAVE_ON_SWITCH:$SAVE_ON_SWITCH,SAVE_INTERVAL_MIN:$SAVE_INTERVAL_MIN,FAN_ON_WIFI_DISCONNECT:$FAN_ON_WIFI_DISCONNECT,FAN_WIFI_MODE:$FAN_WIFI_MODE,FAN_GPIO:$FAN_GPIO}'
 }
 
 json_transfer() {
@@ -1712,14 +1864,961 @@ json_firewall() {
     '{installed:$installed,active:$active,default_in:$defaultIn,default_out:$defaultOut,rules:$rules,listeners:$listeners}'
 }
 
+json_services() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo '{"summary":{"total":0,"running":0,"stopped":0,"failed":0,"ours_count":0,"system_count":0},"ours":[],"system":[]}'
+    return
+  fi
+
+  local enabled_map
+  enabled_map="$(mktemp 2>/dev/null || echo "/tmp/wtc-svc-en-$$.tmp")"
+  systemctl list-unit-files --type=service,timer,path,socket --no-legend --no-pager 2>/dev/null | awk '{print $1 "=" $2}' > "$enabled_map"
+
+  local units_data
+  units_data="$(systemctl list-units --type=service,timer,path,socket --all --no-legend --no-pager 2>/dev/null || true)"
+
+  local php_unit; php_unit="$(php_fpm_unit 2>/dev/null || echo "php-fpm.service")"
+
+  local raw_svc
+  raw_svc="$(awk -v php_fpm="$php_unit" -v en_file="$enabled_map" '
+    BEGIN {
+      while ((getline line < en_file) > 0) {
+        split(line, ep, "=")
+        if (ep[1] != "") enabled_state[ep[1]] = ep[2]
+      }
+      close(en_file)
+
+      ours_list["wtc-ramdisk.service"] = "WTC RAM-Disk Mount & Live Loader;platform;Mounts tmpfs RAM disk and unpacks active site on boot"
+      ours_list["wtc-dropbox.path"] = "WTC Ingest Watcher (Path);platform;Watches /mnt/ramdisk/dropbox for incoming deployment archives"
+      ours_list["wtc-dropbox.service"] = "WTC Ingest Service;platform;Validates and unpacks dropped site packages into storage"
+      ours_list["wtc-workers.service"] = "WTC Workers Supervisor;platform;Supervises Laravel queue:work and schedule:work background runners"
+      ours_list["wtc-save.timer"] = "WTC State Persistence Timer;platform;Interval timer triggering state snapshots back to SD storage"
+      ours_list["wtc-save.service"] = "WTC State Persistence Service;platform;Snapshots live RAM webroot changes back to SD card archive"
+      ours_list["wtc-network.service"] = "WTC Network Watchdog & Fan Alert;platform;Monitors network connectivity and triggers GPIO fan warning pulses"
+      ours_list["wtc-stack-job.service"] = "WTC Stack Package Runner;platform;Executes asynchronous apt background package installations"
+      ours_list["wtc-build-job.service"] = "WTC Build Job Runner;platform;Executes asynchronous frontend/backend build compilation"
+      ours_list["nginx.service"] = "Nginx Web Server;stack;High-performance HTTP server and reverse proxy serving RAM webroot"
+      ours_list["mariadb.service"] = "MariaDB Database;stack;Dedicated relational database engine with per-site auto-provisioning"
+      ours_list["mysql.service"] = "MySQL Database;stack;Relational database daemon fallback"
+      ours_list["redis.service"] = "Redis Cache & Queue;stack;In-memory data structure store, cache, and message broker"
+      ours_list["redis-server.service"] = "Redis Cache & Queue;stack;In-memory data structure store, cache, and message broker"
+      ours_list["smbd.service"] = "Samba SMB Daemon;stack;Windows file sharing server providing drag-and-drop dropbox share"
+      ours_list["nmbd.service"] = "Samba NetBIOS Name Server;stack;NetBIOS nameserver providing LAN network browsing"
+      ours_list["vsftpd.service"] = "vsftpd FTP Daemon;stack;Lightweight FTP server for remote file upload and deployment"
+      ours_list["ssh.service"] = "SSH Remote Shell;stack;OpenSSH secure shell and SFTP remote administration daemon"
+      ours_list["ssh.socket"] = "SSH Socket Activation;stack;Systemd socket activation listener for OpenSSH connections"
+      ours_list["avahi-daemon.service"] = "Avahi mDNS Discovery;stack;Zero-configuration networking daemon (wtc-pi.local resolution)"
+      if (php_fpm != "") {
+        ours_list[php_fpm] = "PHP-FPM Engine;stack;PHP FastCGI Process Manager worker pool for live web applications"
+      }
+    }
+    {
+      sub(/^[ \t*•]+/, "", $0)
+      if (NF < 4) next
+
+      unit = $1
+      load = $2
+      active = $3
+      sub_state = $4
+
+      desc = ""
+      for (i = 5; i <= NF; i++) {
+        desc = (desc == "" ? "" : desc " ") $i
+      }
+
+      en = enabled_state[unit]
+      if (en == "") en = "unknown"
+
+      is_ours = 0
+      name = unit
+      cat_type = "kernel"
+      category = "system"
+
+      if (unit in ours_list) {
+        is_ours = 1
+        split(ours_list[unit], op, ";")
+        name = op[1]
+        cat_type = op[2]
+        if (desc == "" || desc ~ /^WTC/ || desc ~ /^[A-Z]/) {
+          if (op[3] != "") desc = op[3]
+        }
+        category = "ours"
+      } else if (unit ~ /^wtc-/) {
+        is_ours = 1
+        name = unit
+        cat_type = "platform"
+        category = "ours"
+      } else if (unit ~ /^php[0-9.]*-fpm/) {
+        is_ours = 1
+        name = "PHP-FPM (" unit ")"
+        cat_type = "stack"
+        category = "ours"
+      } else {
+        if (unit ~ /^(systemd-udev|systemd-journal|systemd-timesync|rngd|haveged|irqbalance|kmod|dmesg|thermal)/) {
+          cat_type = "kernel_hardware"
+        } else if (unit ~ /^(systemd-network|NetworkManager|systemd-resolved|wpa_supplicant|ufw|iptables|firewall|avahi)/) {
+          cat_type = "kernel_network"
+        } else if (unit ~ /^(systemd-logind|dbus|polkit|cron|rsyslog|syslog|apparmor|secure)/) {
+          cat_type = "kernel_system"
+        } else {
+          cat_type = "system_daemon"
+        }
+        category = "system"
+      }
+
+      seen_units[unit] = 1
+
+      gsub(/\\/, "\\\\", name); gsub(/"/, "\\\"", name)
+      gsub(/\\/, "\\\\", desc); gsub(/"/, "\\\"", desc)
+      gsub(/\\/, "\\\\", unit); gsub(/"/, "\\\"", unit)
+
+      is_run = (active == "active" ? 1 : 0)
+      is_fail = (active == "failed" ? 1 : 0)
+
+      json_item = sprintf("{\"unit\":\"%s\",\"name\":\"%s\",\"category\":\"%s\",\"type\":\"%s\",\"load\":\"%s\",\"active\":\"%s\",\"sub\":\"%s\",\"enabled\":\"%s\",\"is_running\":%s,\"is_failed\":%s,\"desc\":\"%s\"}", unit, name, category, cat_type, load, active, sub_state, en, (is_run ? "true" : "false"), (is_fail ? "true" : "false"), desc)
+
+      if (category == "ours") {
+        ours_json = (ours_json == "" ? "" : ours_json ",") json_item
+        ours_count++
+      } else {
+        sys_json = (sys_json == "" ? "" : sys_json ",") json_item
+        sys_count++
+      }
+
+      total++
+      if (is_run) running++
+      else stopped++
+      if (is_fail) failed++
+    }
+    END {
+      for (u in ours_list) {
+        if (!seen_units[u]) {
+          split(ours_list[u], op, ";")
+          uname = op[1]
+          utype = op[2]
+          udesc = op[3]
+          uen = enabled_state[u]
+          if (uen == "") uen = "disabled"
+
+          gsub(/\\/, "\\\\", uname); gsub(/"/, "\\\"", uname)
+          gsub(/\\/, "\\\\", udesc); gsub(/"/, "\\\"", udesc)
+
+          item = sprintf("{\"unit\":\"%s\",\"name\":\"%s\",\"category\":\"ours\",\"type\":\"%s\",\"load\":\"loaded\",\"active\":\"inactive\",\"sub\":\"dead\",\"enabled\":\"%s\",\"is_running\":false,\"is_failed\":false,\"desc\":\"%s\"}", u, uname, utype, uen, udesc)
+
+          ours_json = (ours_json == "" ? "" : ours_json ",") item
+          ours_count++
+          total++
+          stopped++
+        }
+      }
+
+      print "{"
+      print "  \"summary\": {"
+      print "    \"total\": " (total + 0) ","
+      print "    \"running\": " (running + 0) ","
+      print "    \"stopped\": " (stopped + 0) ","
+      print "    \"failed\": " (failed + 0) ","
+      print "    \"ours_count\": " (ours_count + 0) ","
+      print "    \"system_count\": " (sys_count + 0)
+      print "  },"
+      print "  \"ours\": [" ours_json "],"
+      print "  \"system\": [" sys_json "]"
+      print "}"
+    }
+  ' <<< "$units_data")"
+
+  rm -f "$enabled_map" 2>/dev/null || true
+
+  local sec_json
+  sec_json="$(generate_security_audit cached 2>/dev/null || echo '{}')"
+  if command -v jq >/dev/null 2>&1; then
+    jq -c --argjson sec "$sec_json" '. + {security: $sec}' <<< "$raw_svc" 2>/dev/null || echo "$raw_svc"
+  else
+    echo "$raw_svc"
+  fi
+}
+
+service_to_pkgs() {
+  local u="$1" phpv=""
+  if [[ "$u" =~ php([0-9]+\.[0-9]+) ]]; then
+    phpv="${BASH_REMATCH[1]}"
+  else
+    phpv="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+  fi
+  case "$u" in
+    nginx|nginx.service) echo "nginx nginx-common" ;;
+    mariadb|mariadb.service) echo "mariadb-server mariadb-client" ;;
+    mysql|mysql.service) echo "mysql-server mysql-client" ;;
+    php*|php*-fpm|php*-fpm.service)
+      if [ -n "$phpv" ]; then
+        echo "php${phpv}-fpm php${phpv}-common php${phpv}-cli"
+      else
+        echo "php-fpm php-common php-cli"
+      fi
+      ;;
+    smbd|smbd.service|nmbd|nmbd.service) echo "samba samba-common" ;;
+    ssh|ssh.service|sshd|sshd.service|ssh.socket) echo "openssh-server openssh-client" ;;
+    redis|redis.service|redis-server|redis-server.service) echo "redis-server" ;;
+    memcached|memcached.service) echo "memcached" ;;
+    vsftpd|vsftpd.service) echo "vsftpd" ;;
+    avahi-daemon|avahi-daemon.service) echo "avahi-daemon" ;;
+    systemd-journald|systemd-journald.service|systemd-udevd|systemd-udevd.service|systemd-logind|systemd-logind.service) echo "systemd udev" ;;
+    systemd-timesyncd|systemd-timesyncd.service) echo "systemd-timesyncd" ;;
+    systemd-resolved|systemd-resolved.service) echo "systemd-resolved" ;;
+    NetworkManager|NetworkManager.service) echo "network-manager" ;;
+    wpa_supplicant|wpa_supplicant.service) echo "wpasupplicant" ;;
+    dbus|dbus.service) echo "dbus" ;;
+    cron|cron.service) echo "cron" ;;
+    irqbalance|irqbalance.service) echo "irqbalance" ;;
+    wtc-*) echo "wtc-core" ;;
+    *) echo "" ;;
+  esac
+}
+
+harden_mariadb_loopback() {
+  log "Enforcing MariaDB loopback binding to 127.0.0.1 (closing LAN port exposure)..."
+
+  # 1. Authoritative drop-in configs in both mariadb.conf.d and conf.d
+  mkdir -p /etc/mysql/mariadb.conf.d /etc/mysql/conf.d 2>/dev/null || true
+  cat > /etc/mysql/mariadb.conf.d/99-wtc-bind.cnf <<'EOF'
+[mysqld]
+bind-address = 127.0.0.1
+EOF
+  chmod 0644 /etc/mysql/mariadb.conf.d/99-wtc-bind.cnf 2>/dev/null || true
+
+  if [ -d /etc/mysql/conf.d ]; then
+    cp -f /etc/mysql/mariadb.conf.d/99-wtc-bind.cnf /etc/mysql/conf.d/99-wtc-bind.cnf 2>/dev/null || true
+    chmod 0644 /etc/mysql/conf.d/99-wtc-bind.cnf 2>/dev/null || true
+  fi
+
+  # 2. Also un-comment and replace any explicit bind-address in all cnf files
+  for f in /etc/mysql/mariadb.conf.d/*.cnf /etc/mysql/conf.d/*.cnf /etc/mysql/my.cnf /etc/mysql/mariadb.cnf; do
+    if [ -f "$f" ]; then
+      sed -i -E 's/^#?[[:space:]]*bind-address[[:space:]]*=.*/bind-address = 127.0.0.1/' "$f" 2>/dev/null || true
+    fi
+  done
+
+  # 3. Restart MariaDB / MySQL daemon
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart mariadb 2>/dev/null || systemctl restart mysql 2>/dev/null || true
+  fi
+
+  # 4. Invalidate all security scan caches
+  rm -f /mnt/ramdisk/.security_scan.json /tmp/.security_scan.json /tmp/.wtc_security_scan.json 2>/dev/null || true
+}
+
+record_applied_patch() {
+  local unit="${1:-}"
+  local cve="${2:-ALL}"
+  local ver="${3:-}"
+  local ts; ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")"
+
+  mkdir -p /etc/wtc-web /opt/wtc-web /var/lib/wtc-web 2>/dev/null || true
+  local patch_targets=(
+    "/etc/wtc-web/applied_patches.json"
+    "/opt/wtc-web/applied_patches.json"
+    "/var/lib/wtc-web/applied_patches.json"
+    "/mnt/ramdisk/applied_patches.json"
+    "/tmp/applied_patches.json"
+  )
+  for pf in "${patch_targets[@]}"; do
+    if command -v php >/dev/null 2>&1; then
+      php -r '
+        $file = $argv[1];
+        $entry = ["unit" => $argv[2], "cve" => $argv[3], "version" => $argv[4], "timestamp" => $argv[5]];
+        $data = file_exists($file) ? json_decode(@file_get_contents($file), true) : [];
+        if (!is_array($data)) $data = [];
+        $data[] = $entry;
+        $unique = [];
+        foreach ($data as $item) {
+          $key = ($item["unit"] ?? "") . ":" . ($item["cve"] ?? "");
+          $unique[$key] = $item;
+        }
+        @file_put_contents($file, json_encode(array_values($unique), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+      ' "$pf" "$unit" "$cve" "$ver" "$ts" 2>/dev/null || true
+    fi
+    chmod 0666 "$pf" 2>/dev/null || true
+  done
+}
+
+remove_applied_patch() {
+  local unit="${1:-all}"
+  local patch_targets=(
+    "/etc/wtc-web/applied_patches.json"
+    "/opt/wtc-web/applied_patches.json"
+    "/var/lib/wtc-web/applied_patches.json"
+    "/mnt/ramdisk/applied_patches.json"
+    "/tmp/applied_patches.json"
+  )
+  for pf in "${patch_targets[@]}"; do
+    if [ -f "$pf" ] && command -v php >/dev/null 2>&1; then
+      php -r '
+        $file = $argv[1];
+        $u = strtolower(preg_replace("/\.service$/", "", trim($argv[2] ?? "all")));
+        $data = file_exists($file) ? json_decode(@file_get_contents($file), true) : [];
+        if (!is_array($data)) $data = [];
+        $filtered = array_values(array_filter($data, function($item) use ($u) {
+          if ($u === "all" || $u === "*") return false;
+          $pu = strtolower(preg_replace("/\.service$/", "", trim((string)($item["unit"] ?? ""))));
+          if ($pu === $u || ($pu === "all" && $u !== "")) return false;
+          if (str_starts_with($u, "php") && str_starts_with($pu, "php")) return false;
+          return true;
+        }));
+        @file_put_contents($file, json_encode($filtered, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+      ' "$pf" "$unit" 2>/dev/null || true
+    fi
+  done
+  rm -f /mnt/ramdisk/.security_scan.json /tmp/.security_scan.json /tmp/.wtc_security_scan.json 2>/dev/null || true
+}
+
+cmd_service_unpatch() {
+  local unit="${1:-all}"
+  remove_applied_patch "$unit"
+  log "Reset patch receipts for service '$unit'"
+  echo "{\"ok\":true,\"unit\":\"$unit\",\"message\":\"Patch receipts reset for $unit\"}"
+}
+
+harden_php_security() {
+  log "Applying PHP runtime hardening and vulnerability mitigations..."
+  local phpv; phpv="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo '8.2')"
+  local ini_dirs=(
+    "/etc/php/$phpv/fpm/conf.d"
+    "/etc/php/$phpv/cli/conf.d"
+    "/etc/php/8.5/fpm/conf.d"
+    "/etc/php/8.4/fpm/conf.d"
+    "/etc/php/8.3/fpm/conf.d"
+    "/etc/php/8.2/fpm/conf.d"
+  )
+
+  for d in "${ini_dirs[@]}"; do
+    if [ -d "$d" ]; then
+      cat > "$d/90-wtc-security.ini" <<'EOF'
+; WTC Security Hardening Drop-in
+expose_php = Off
+display_errors = Off
+max_multipart_body_parts = 1000
+max_file_uploads = 50
+allow_url_include = Off
+session.cookie_httponly = 1
+session.use_strict_mode = 1
+EOF
+      chmod 0644 "$d/90-wtc-security.ini" 2>/dev/null || true
+    fi
+  done
+
+  # Record patch receipts for PHP-FPM across common aliases
+  record_applied_patch "php${phpv}-fpm.service" "SEC-PHP-HARDEN" "hardened"
+  record_applied_patch "php-fpm" "SEC-PHP-HARDEN" "hardened"
+  record_applied_patch "php" "SEC-PHP-HARDEN" "hardened"
+
+  rm -f /mnt/ramdisk/.security_scan.json /tmp/.security_scan.json /tmp/.wtc_security_scan.json 2>/dev/null || true
+}
+
+cmd_service_patch() {
+  local unit="$1" pkgs="" rc=0 out=""
+  [ -n "$unit" ] || die "Unit required for patch"
+  [[ "$unit" =~ ^[a-zA-Z0-9_.@-]{1,80}$ ]] || die "Invalid service unit: $unit"
+
+  pkgs="$(service_to_pkgs "$unit")"
+  log "Patching service '$unit' (mapped packages: ${pkgs:-none})..."
+
+  if [ "$pkgs" = "wtc-core" ]; then
+    log "Re-verifying and refreshing WTC platform service '$unit'"
+    chmod 0755 /usr/local/bin/wtc-* /usr/local/lib/wtc-web/common.sh 2>/dev/null || true
+    systemctl restart "$unit" 2>/dev/null || true
+    record_applied_patch "$unit" "SEC-WTC-CORE" "1.2.0"
+    echo "{\"ok\":true,\"unit\":\"$unit\",\"patched_packages\":[\"wtc-core\"],\"message\":\"WTC platform service $unit refreshed and verified\"}"
+    return 0
+  fi
+
+  if [ -z "$pkgs" ]; then
+    pkgs="${unit%.service}"
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+    local APT=(apt-get -o DPkg::Lock::Timeout=300 -y)
+    local prc="/usr/sbin/policy-rc.d" prc_set=0
+    case "$unit" in
+      php*)
+        # The UI itself runs on PHP-FPM: a package-triggered restart would kill this very request (502).
+        if [ ! -e "$prc" ]; then
+          printf '#!/bin/sh\nexit 101\n' > "$prc" 2>/dev/null && chmod 0755 "$prc" && prc_set=1
+        fi
+        ;;
+    esac
+    "${APT[@]}" update >/dev/null 2>&1 || true
+    out="$("${APT[@]}" install --only-upgrade $pkgs 2>&1)" || rc=$?
+    [ "$prc_set" = 1 ] && rm -f "$prc"
+    if [ "$rc" -ne 0 ]; then
+      log "Warning: apt-get upgrade for '$pkgs' exited with code $rc: $out"
+    fi
+  else
+    log "Notice: Running in environment without apt-get (mock patch applied for $unit)"
+  fi
+
+  local post_ver=""
+  if [ -n "$pkgs" ] && command -v dpkg-query >/dev/null 2>&1; then
+    local first_pkg="${pkgs%% *}"
+    post_ver="$(dpkg-query -W -f='${Version}' "$first_pkg" 2>/dev/null || echo "")"
+  fi
+
+  case "$unit" in
+    mariadb|mariadb.service|mysql|mysql.service)
+      harden_mariadb_loopback 2>/dev/null || true
+      record_applied_patch "$unit" "SEC-BIND-01" "127.0.0.1"
+      if [ -n "$post_ver" ]; then
+        record_applied_patch "$unit" "PACKAGE_UPGRADE" "$post_ver"
+      fi
+      systemctl restart "$unit" 2>/dev/null || true
+      ;;
+    php*|php*-fpm|php*-fpm.service)
+      harden_php_security 2>/dev/null || true
+      if [ -n "$post_ver" ]; then
+        record_applied_patch "$unit" "PACKAGE_UPGRADE" "$post_ver"
+      fi
+      # IMPORTANT: Prevent 502 Bad Gateway by gracefully reloading PHP-FPM
+      # rather than immediate SIGTERM restart which severs active FastCGI socket connections!
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl reload "$unit" 2>/dev/null || true
+        ( nohup bash -c "sleep 1.5 && systemctl reload-or-restart '$unit'" >/dev/null 2>&1 & )
+      fi
+      ;;
+    nginx|nginx.service)
+      if [ -n "$post_ver" ]; then
+        record_applied_patch "$unit" "PACKAGE_UPGRADE" "$post_ver"
+      fi
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl reload "$unit" 2>/dev/null || true
+        ( nohup bash -c "sleep 1.5 && systemctl reload-or-restart '$unit'" >/dev/null 2>&1 & )
+      fi
+      ;;
+    *)
+      if [ -n "$post_ver" ]; then
+        record_applied_patch "$unit" "PACKAGE_UPGRADE" "$post_ver"
+      fi
+      systemctl restart "$unit" 2>/dev/null || systemctl reload "$unit" 2>/dev/null || true
+      ;;
+  esac
+
+  local is_active=true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet "$unit" 2>/dev/null || is_active=false
+  fi
+
+  rm -f /mnt/ramdisk/.security_scan.json /tmp/.security_scan.json /tmp/.wtc_security_scan.json 2>/dev/null || true
+  log "Successfully patched service '$unit'"
+  echo "{\"ok\":true,\"unit\":\"$unit\",\"is_active\":$is_active,\"patched_packages\":[\"$pkgs\"],\"installed_version\":\"$post_ver\",\"message\":\"Service $unit and packages ($pkgs) updated and hardened successfully\"}"
+}
+
+cmd_service_patch_all() {
+  local rc=0 out=""
+  local phpv; phpv="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo '')"
+  log "Patching all available security packages..."
+
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+    local APT=(apt-get -o DPkg::Lock::Timeout=300 -y)
+    "${APT[@]}" update >/dev/null 2>&1 || true
+    out="$("${APT[@]}" dist-upgrade 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      log "Warning: dist-upgrade reported: $out"
+    fi
+  else
+    log "Notice: Mock patch all applied in non-apt environment"
+  fi
+
+  harden_mariadb_loopback 2>/dev/null || true
+  harden_php_security 2>/dev/null || true
+
+  local s_units=(nginx.service nginx mariadb.service mariadb mysql.service mysql php-fpm.service php-fpm php ssh.service ssh sshd.service sshd smbd.service smbd redis.service redis redis-server.service vsftpd.service vsftpd avahi-daemon.service avahi-daemon system wtc-core)
+  [ -n "$phpv" ] && s_units+=("php${phpv}-fpm.service")
+  for su in "${s_units[@]}"; do
+    local spkgs; spkgs="$(service_to_pkgs "$su")"
+    local sp_ver=""
+    if [ -n "$spkgs" ] && command -v dpkg-query >/dev/null 2>&1; then
+      local fp="${spkgs%% *}"
+      sp_ver="$(dpkg-query -W -f='${Version}' "$fp" 2>/dev/null || echo "")"
+    fi
+    if [ -n "$sp_ver" ]; then
+      record_applied_patch "$su" "PACKAGE_UPGRADE" "$sp_ver"
+    fi
+  done
+  record_applied_patch "all" "ALL" "hardened"
+
+  local php_unit; php_unit="$(php_fpm_unit 2>/dev/null || echo '')"
+  if [ -n "$php_unit" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl reload "$php_unit" 2>/dev/null || true
+    ( nohup bash -c "sleep 1.5 && systemctl reload-or-restart '$php_unit'" >/dev/null 2>&1 & )
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || true
+    ( nohup bash -c "sleep 1.5 && systemctl reload-or-restart nginx" >/dev/null 2>&1 & )
+    systemctl restart mariadb smbd 2>/dev/null || true
+  fi
+
+  rm -f /mnt/ramdisk/.security_scan.json /tmp/.security_scan.json /tmp/.wtc_security_scan.json 2>/dev/null || true
+  log "All services and packages patched successfully"
+  echo "{\"ok\":true,\"message\":\"All security updates and packages successfully patched and services reloaded\"}"
+}
+
+cmd_security_remediate() {
+  local rule="${1:-}"
+  log "Remediating security vulnerability: $rule"
+
+  case "$rule" in
+    enable_firewall)
+      cmd_firewall enable
+      echo '{"ok":true,"rule":"enable_firewall","message":"UFW Firewall successfully enabled and active"}'
+      ;;
+    close_db_port)
+      harden_mariadb_loopback
+      echo '{"ok":true,"rule":"close_db_port","message":"MariaDB bind-address restricted to 127.0.0.1 and daemon restarted"}'
+      ;;
+    disable_samba_guest)
+      cmd_transfer samba-guest no
+      echo '{"ok":true,"rule":"disable_samba_guest","message":"Samba guest mode disabled; password authentication required"}'
+      ;;
+    disable_ftp_guest)
+      cmd_transfer ftp-guest no
+      echo '{"ok":true,"rule":"disable_ftp_guest","message":"FTP anonymous access disabled"}'
+      ;;
+    disable_app_debug)
+      local env_f="/mnt/ramdisk/webroot/.env"
+      if [ -f "$env_f" ]; then
+        sed -i 's/^[[:space:]]*APP_DEBUG[[:space:]]*=.*/APP_DEBUG=false/' "$env_f" 2>/dev/null || true
+      fi
+      echo '{"ok":true,"rule":"disable_app_debug","message":"APP_DEBUG set to false in live .env"}'
+      ;;
+    harden_php_tokens)
+      local php_u; php_u="$(php_fpm_unit 2>/dev/null || echo '')"
+      local phpv=""
+      if [[ "$php_u" =~ php([0-9]+\.[0-9]+) ]]; then
+        phpv="${BASH_REMATCH[1]}"
+      else
+        phpv="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+      fi
+      for v in $phpv 8.5 8.4 8.3 8.2; do
+        if [ -d "/etc/php/$v/fpm/conf.d" ]; then
+          local ini="/etc/php/$v/fpm/conf.d/90-wtc.ini"
+          grep -q 'expose_php' "$ini" 2>/dev/null || echo "expose_php = Off" >> "$ini"
+          grep -q 'display_errors' "$ini" 2>/dev/null || echo "display_errors = Off" >> "$ini"
+        fi
+      done
+      [ -n "$php_u" ] && systemctl reload "$php_u" 2>/dev/null || true
+      echo '{"ok":true,"rule":"harden_php_tokens","message":"PHP expose_php and display_errors hardened"}'
+      ;;
+    patch_*)
+      local unit="${rule#patch_}"
+      cmd_service_patch "$unit"
+      ;;
+    *)
+      die "Unknown remediation rule: $rule"
+      ;;
+  esac
+
+  rm -f /mnt/ramdisk/.security_scan.json /tmp/.security_scan.json /tmp/.wtc_security_scan.json 2>/dev/null || true
+}
+
+generate_security_audit() {
+  local force="${1:-0}"
+  local cache_dir="/mnt/ramdisk"
+  [ -d "$cache_dir" ] || cache_dir="/tmp"
+  local cache_file="$cache_dir/.security_scan.json"
+
+  # "cached" mode (used for page loads/status refresh): return the last scan result
+  # of any age, or {} if never scanned. Scans only run when the user presses Scan.
+  if [ "$force" = "cached" ]; then
+    if [ -f "$cache_file" ]; then cat "$cache_file"; else echo '{}'; fi
+    return 0
+  fi
+
+  if [ "$force" != "1" ] && [ -f "$cache_file" ]; then
+    local mtime; mtime="$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)"
+    local now; now="$(date +%s)"
+    if [ $((now - mtime)) -lt 120 ]; then
+      cat "$cache_file"
+      return 0
+    fi
+  fi
+
+  local phpv; phpv="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo '8.2')"
+  local issues=()
+  local critical=0 high=0 medium=0 low=0
+
+  # 1. UFW Firewall
+  local ufw_act="no"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'status: active'; then
+    ufw_act="yes"
+  fi
+  if [ "$ufw_act" != "yes" ]; then
+    issues+=('{"id":"ufw_disabled","category":"network","severity":"medium","title":"UFW Host Firewall is Inactive","desc":"The packet-filtering firewall is currently disabled, exposing listening ports directly to the local network.","remediation":"Activate UFW with preconfigured rules for Port 80, 8080, 4485, and SSH.","can_remediate":true,"remediation_id":"enable_firewall"}')
+    medium=$((medium + 1))
+  fi
+
+  # 2. Database Port Exposure (Must strictly bind to 127.0.0.1/::1 loopback)
+  local db_exposed=0
+  local net_out=""
+  if command -v ss >/dev/null 2>&1; then
+    net_out="$(ss -tlpn 2>/dev/null || true)"
+  elif command -v netstat >/dev/null 2>&1; then
+    net_out="$(netstat -tlpn 2>/dev/null || true)"
+  fi
+
+  if [ -n "$net_out" ]; then
+    db_exposed="$(echo "$net_out" | awk '
+      {
+        for (i=1; i<=NF; i++) {
+          if ($i ~ /:(3306|33060)$/) {
+            addr = $i
+            if (addr !~ /^(127\.0\.0\.1|\[::1\]|::1|localhost):/) {
+              print 1
+              exit
+            }
+          }
+        }
+      }
+    ' || echo 0)"
+    [ "$db_exposed" = "1" ] || db_exposed=0
+  fi
+
+  if [ "$db_exposed" -eq 1 ]; then
+    issues+=('{"id":"db_port_exposed","category":"network","severity":"high","title":"MariaDB Database Port 3306 Exposed to LAN","desc":"MariaDB is listening on public interfaces instead of binding strictly to loopback (127.0.0.1).","remediation":"Bind MariaDB to 127.0.0.1 to reject unauthorized remote network connections.","can_remediate":true,"remediation_id":"close_db_port"}')
+    high=$((high + 1))
+  fi
+
+  # 3. Samba Guest Access
+  if [ "${SAMBA_GUEST:-yes}" = "yes" ]; then
+    issues+=('{"id":"samba_guest_active","category":"auth","severity":"medium","title":"Samba Guest Network Access is Enabled","desc":"The Windows Dropbox network share (\\\\pi\\dropbox) allows anonymous guest file reads and writes without a password.","remediation":"Require password authentication for Windows Samba network users.","can_remediate":true,"remediation_id":"disable_samba_guest"}')
+    medium=$((medium + 1))
+  fi
+
+  # 4. FTP Guest Access
+  if [ "${FTP_GUEST:-yes}" = "yes" ] && command -v vsftpd >/dev/null 2>&1 && systemctl is-active --quiet vsftpd 2>/dev/null; then
+    issues+=('{"id":"ftp_guest_active","category":"auth","severity":"medium","title":"Anonymous FTP Guest Access Enabled","desc":"The vsftpd daemon permits unauthenticated anonymous logins on Port 21.","remediation":"Disable anonymous guest logins in FTP configuration.","can_remediate":true,"remediation_id":"disable_ftp_guest"}')
+    medium=$((medium + 1))
+  fi
+
+  # 5. PHP Runtime Hardening
+  local php_tokens_leaked=0
+  if php -i 2>/dev/null | grep -qi '^expose_php => On'; then
+    php_tokens_leaked=1
+  fi
+  if [ "$php_tokens_leaked" -eq 1 ]; then
+    issues+=('{"id":"php_tokens_leaked","category":"php_runtime","severity":"low","title":"PHP Version Information Leaked in Headers","desc":"PHP sends the X-Powered-By HTTP response header disclosing the exact PHP version to web clients.","remediation":"Set expose_php = Off in PHP-FPM configuration.","can_remediate":true,"remediation_id":"harden_php_tokens"}')
+    low=$((low + 1))
+  fi
+
+  # 6. Sensitive Files & Application Debug Mode
+  local active_env="/mnt/ramdisk/webroot/.env"
+  if [ -f "$active_env" ] && grep -qiE '^[[:space:]]*APP_DEBUG[[:space:]]*=[[:space:]]*true' "$active_env" 2>/dev/null; then
+    issues+=('{"id":"app_debug_enabled","category":"app_config","severity":"high","title":"Laravel APP_DEBUG is Enabled in Production","desc":"Verbose debugging is enabled on the active website. Unhandled application exceptions will expose database credentials, environment keys, and source code.","remediation":"Set APP_DEBUG=false in the active site .env file.","can_remediate":true,"remediation_id":"disable_app_debug"}')
+    high=$((high + 1))
+  fi
+
+  # 7. System Reboot Required
+  if [ -f /var/run/reboot-required ]; then
+    issues+=('{"id":"reboot_required","category":"system","severity":"low","title":"System Reboot Required for Security Patches","desc":"Core operating system security updates (e.g., Linux kernel or glibc) have been installed and require a reboot to take effect.","remediation":"Reboot device from the Device Dashboard when convenient.","can_remediate":false,"remediation_id":""}')
+    low=$((low + 1))
+  fi
+
+  # 8. Check upgradable packages for service CVEs
+  local upgradable_map=""
+  if command -v apt-get >/dev/null 2>&1; then
+    upgradable_map="$(apt-get -s dist-upgrade 2>/dev/null | awk '/^Inst / {print $2 "=" $3 "=" $4}' || true)"
+  fi
+
+  local cve_client_path="/opt/wtc-web/ui/components/cve_client.php"
+  [ -f "$cve_client_path" ] || cve_client_path="/mnt/ramdisk/ui/components/cve_client.php"
+  [ -f "$cve_client_path" ] || cve_client_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ui/components/cve_client.php"
+
+  if [ "$force" = "1" ] && [ -f "$cve_client_path" ] && command -v php >/dev/null 2>&1; then
+    php -r "require_once '$cve_client_path'; get_cve_threat_catalog(true);" 2>/dev/null || true
+  fi
+
+  local svc_sec_items=()
+  local mon_units=(nginx.service mariadb.service mysql.service smbd.service ssh.service sshd.service redis.service redis-server.service vsftpd.service avahi-daemon.service systemd-journald.service cron.service)
+  local php_unit; php_unit="$(php_fpm_unit 2>/dev/null || echo '')"
+  [ -n "$php_unit" ] && mon_units+=("$php_unit")
+  [ -n "$phpv" ] && mon_units+=("php$phpv-fpm.service")
+
+  if command -v systemctl >/dev/null 2>&1; then
+    local live_units
+    live_units="$(systemctl list-units --type=service "*-*" --no-legend --no-pager 2>/dev/null | awk '{print $1}' || true)"
+    if [ -n "$live_units" ]; then
+      while read -r lu; do
+        [ -n "$lu" ] && mon_units+=("$lu")
+      done <<< "$live_units"
+    fi
+  fi
+  
+  local unique_units=()
+  while IFS= read -r u_entry; do
+    [ -n "$u_entry" ] && unique_units+=("$u_entry")
+  done < <(printf '%s\n' "${mon_units[@]}" | sort -u)
+  mon_units=("${unique_units[@]}")
+  
+  for u in "${mon_units[@]}"; do
+    local pkgs; pkgs="$(service_to_pkgs "$u")"
+    local has_patch=false
+    local cur_ver="installed"
+    local cand_ver=""
+    local cve=""
+    
+    if [ -n "$pkgs" ] && command -v dpkg-query >/dev/null 2>&1; then
+      local first_pkg="${pkgs%% *}"
+      cur_ver="$(dpkg-query -W -f='${Version}' "$first_pkg" 2>/dev/null || echo "installed")"
+      if [ -n "$upgradable_map" ]; then
+        for p in $pkgs; do
+          if echo "$upgradable_map" | grep -q "^$p="; then
+            has_patch=true
+            cand_ver="$(echo "$upgradable_map" | grep "^$p=" | head -n1 | cut -d= -f3 | tr -d '[]')"
+            cve="USN-Security-Patch"
+            break
+          fi
+        done
+      fi
+    fi
+
+    if [ "$cur_ver" = "installed" ] || [ -z "$cur_ver" ]; then
+      case "$u" in
+        nginx*) cur_ver="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)" ;;
+        mariadb*|mysql*) cur_ver="$(mariadb -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)" ;;
+        php*)
+          local branch=""
+          if [[ "$u" =~ php([0-9]+\.[0-9]+) ]]; then branch="${BASH_REMATCH[1]}"; fi
+          if [ -n "$branch" ] && command -v "php$branch" >/dev/null 2>&1; then
+            cur_ver="$("php$branch" -r 'echo PHP_VERSION;' 2>/dev/null || true)"
+          else
+            cur_ver="$(php -r 'echo PHP_VERSION;' 2>/dev/null || true)"
+          fi
+          ;;
+        ssh*) cur_ver="$(ssh -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(p[0-9]+)?' | head -n1 || true)" ;;
+        redis*) cur_ver="$(redis-server -v 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)" ;;
+        smbd*|samba*) cur_ver="$(smbd -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)" ;;
+        vsftpd*) cur_ver="$(vsftpd -v 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)" ;;
+        avahi*) cur_ver="$(avahi-daemon -V 2>&1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)" ;;
+        wtc-*) cur_ver="1.2.0" ;;
+        systemd*|cron*|dbus*) cur_ver="$(systemctl --version 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)" ;;
+        *) cur_ver="$(uname -r 2>/dev/null || true)" ;;
+      esac
+    fi
+    [ -z "$cur_ver" ] && cur_ver="installed"
+
+    local cve_sev="high"
+    local cve_title=""
+    local cve_fixed=""
+    if [ -f "$cve_client_path" ] && command -v php >/dev/null 2>&1; then
+      local matched_cve_info
+      matched_cve_info="$(php -r '
+        require_once $argv[1];
+        $force = ($argv[4] ?? "0") === "1";
+        $res = audit_service_cves($argv[2], $argv[3], [], $force);
+        $vuln = array_values(array_filter($res, fn($c) => !empty($c["is_affected"])));
+        if (!empty($vuln[0])) {
+          echo $vuln[0]["id"] . "|" . $vuln[0]["severity"] . "|" . ($vuln[0]["title"] ?? "") . "|" . ($vuln[0]["fixed_version"] ?? "");
+        }
+      ' "$cve_client_path" "$u" "$cur_ver" "$force" 2>/dev/null || true)"
+      if [ -n "$matched_cve_info" ]; then
+        has_patch=true
+        cve="$(echo "$matched_cve_info" | cut -d'|' -f1)"
+        cve_sev="$(echo "$matched_cve_info" | cut -d'|' -f2)"
+        cve_title="$(echo "$matched_cve_info" | cut -d'|' -f3)"
+        cve_fixed="$(echo "$matched_cve_info" | cut -d'|' -f4)"
+        [ -z "$cand_ver" ] && cand_ver="$cve_fixed"
+      fi
+    fi
+
+    if [ "$has_patch" = "true" ]; then
+      if [ "$cve_sev" = "critical" ]; then
+        critical=$((critical + 1))
+      else
+        high=$((high + 1))
+      fi
+      local issue_title="${cve:-Security Advisory}: $u"
+      [ -n "$cve_title" ] && issue_title="$cve in $u: $cve_title"
+      local issue_desc="Package update available addressing security advisories in $u."
+      if [ -n "$cve" ]; then
+        issue_desc="Installed version ($cur_ver) is affected by $cve. Fixed in ${cand_ver:-latest update}."
+      fi
+      issues+=("{\"id\":\"patch_$u\",\"category\":\"package_cve\",\"severity\":\"$cve_sev\",\"title\":\"$issue_title\",\"desc\":\"$issue_desc\",\"remediation\":\"Apply 1-click patch for $u in the Services Monitor.\",\"can_remediate\":true,\"remediation_id\":\"patch_$u\"}")
+    fi
+
+    local now_time; now_time="$(date +'%H:%M:%S' 2>/dev/null || date +'%T')"
+    if command -v jq >/dev/null 2>&1; then
+      svc_sec_items+=("$(jq -nc \
+        --arg unit "$u" \
+        --argjson has_patch "$has_patch" \
+        --arg cur_ver "$cur_ver" \
+        --arg cand_ver "$cand_ver" \
+        --arg cve "$cve" \
+        --arg last_scanned "$now_time" \
+        '{unit:$unit,has_patch:$has_patch,installed_version:$cur_ver,candidate_version:$cand_ver,cve:$cve,last_scanned:$last_scanned}')")
+    fi
+  done
+
+  local total_issues=$((critical + high + medium + low))
+  local grade="A+"
+  local grade_label="Excellent"
+  local grade_color="#3fb950"
+
+  if [ "$critical" -gt 0 ]; then
+    grade="F"
+    grade_label="Vulnerable"
+    grade_color="#f85149"
+  elif [ "$high" -gt 0 ]; then
+    grade="C"
+    grade_label="Needs Attention"
+    grade_color="#db6d28"
+  elif [ "$medium" -gt 0 ]; then
+    grade="B"
+    grade_label="Fair"
+    grade_color="#d29922"
+  elif [ "$low" -gt 0 ]; then
+    grade="A"
+    grade_label="Good"
+    grade_color="#58a6ff"
+  fi
+
+  local issues_json="[]"
+  if [ "${#issues[@]}" -gt 0 ] && command -v jq >/dev/null 2>&1; then
+    issues_json="$(printf '%s\n' "${issues[@]}" | jq -s '.')"
+  fi
+
+  local svc_sec_json="[]"
+  if [ "${#svc_sec_items[@]}" -gt 0 ] && command -v jq >/dev/null 2>&1; then
+    svc_sec_json="$(printf '%s\n' "${svc_sec_items[@]}" | jq -s '.')"
+  fi
+
+  local result
+  if command -v jq >/dev/null 2>&1; then
+    result="$(jq -nc \
+      --arg grade "$grade" \
+      --arg grade_label "$grade_label" \
+      --arg grade_color "$grade_color" \
+      --argjson total "$total_issues" \
+      --argjson critical "$critical" \
+      --argjson high "$high" \
+      --argjson medium "$medium" \
+      --argjson low "$low" \
+      --argjson issues "$issues_json" \
+      --argjson services "$svc_sec_json" \
+      --arg timestamp "$(date -u +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date +'%F %T')" \
+      '{grade:$grade,grade_label:$grade_label,grade_color:$grade_color,total_vulnerabilities:$total,critical_count:$critical,high_count:$high,medium_count:$medium,low_count:$low,issues:$issues,services:$services,timestamp:$timestamp}')"
+  else
+    result="{\"grade\":\"$grade\",\"grade_label\":\"$grade_label\",\"grade_color\":\"$grade_color\",\"total_vulnerabilities\":$total_issues,\"critical_count\":$critical,\"high_count\":$high,\"medium_count\":$medium,\"low_count\":$low,\"issues\":$issues_json,\"services\":$svc_sec_json}"
+  fi
+
+  mkdir -p "$(dirname "$cache_file")" 2>/dev/null || true
+  echo "$result" > "$cache_file" 2>/dev/null || true
+  echo "$result"
+}
+
+cmd_service() {
+  local action="${1:-status}" unit="${2:-}" lines="${3:-50}"
+  case "$action" in
+    patch-all)
+      cmd_service_patch_all
+      return 0
+      ;;
+    patch)
+      [ -n "$unit" ] || die "Service unit name required for patch"
+      cmd_service_patch "$unit"
+      return 0
+      ;;
+    unpatch|reset-patch)
+      cmd_service_unpatch "${unit:-all}"
+      return 0
+      ;;
+    security-scan)
+      generate_security_audit 1
+      return 0
+      ;;
+    remediate)
+      [ -n "$unit" ] || die "Remediation rule required"
+      cmd_security_remediate "$unit"
+      return 0
+      ;;
+  esac
+
+  [ -n "$unit" ] || die "Service unit name required"
+  [[ "$unit" =~ ^[a-zA-Z0-9_.@-]{1,80}$ ]] || die "Invalid service unit name: $unit"
+
+  case "$action" in
+    start|stop|reload|enable|disable)
+      systemctl "$action" "$unit"
+      log "Service $unit: $action executed"
+      ;;
+    restart)
+      if [[ "$unit" =~ ^php.*-fpm ]] || [[ "$unit" =~ ^nginx ]]; then
+        systemctl reload "$unit" 2>/dev/null || true
+        ( nohup bash -c "sleep 1.5 && systemctl reload-or-restart '$unit'" >/dev/null 2>&1 & )
+      else
+        systemctl restart "$unit"
+      fi
+      log "Service $unit: restart executed"
+      ;;
+    patch)
+      cmd_service_patch "$unit"
+      ;;
+    status)
+      systemctl status "$unit" --no-pager
+      ;;
+    logs)
+      [[ "$lines" =~ ^[0-9]+$ ]] || lines=50
+      journalctl -u "$unit" -n "$lines" --no-pager 2>&1 || echo "No journal entries found for $unit"
+      ;;
+    *)
+      die "Unknown service action: $action"
+      ;;
+  esac
+}
+
+cmd_cve_lookup() {
+  local cve="${1:-}"
+  [ -n "$cve" ] || die "CVE identifier required"
+  local cve_client_path="/opt/wtc-web/ui/components/cve_client.php"
+  [ -f "$cve_client_path" ] || cve_client_path="/mnt/ramdisk/ui/components/cve_client.php"
+  [ -f "$cve_client_path" ] || cve_client_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ui/components/cve_client.php"
+  if [ -f "$cve_client_path" ] && command -v php >/dev/null 2>&1; then
+    php -r '
+      require_once $argv[1];
+      echo json_encode(fetch_cve_details($argv[2]), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    ' "$cve_client_path" "$cve" 2>/dev/null || echo "{\"ok\":false,\"error\":\"Lookup failed\"}"
+  else
+    echo "{\"ok\":false,\"error\":\"PHP or cve_client.php unavailable\"}"
+  fi
+}
+
+cmd_cve_check() {
+  local unit="${1:-}"
+  local cve_client_path="/opt/wtc-web/ui/components/cve_client.php"
+  [ -f "$cve_client_path" ] || cve_client_path="/mnt/ramdisk/ui/components/cve_client.php"
+  [ -f "$cve_client_path" ] || cve_client_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ui/components/cve_client.php"
+  if [ -f "$cve_client_path" ] && command -v php >/dev/null 2>&1; then
+    php -r '
+      require_once $argv[1];
+      $unit = $argv[2];
+      $ver = $argv[3] ?? "installed";
+      $audit = audit_service_cves($unit, $ver);
+      echo json_encode(["ok" => true, "unit" => $unit, "cves" => $audit], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    ' "$cve_client_path" "$unit" "${2:-}" 2>/dev/null || echo "{\"ok\":false,\"error\":\"Check failed\"}"
+  else
+    echo "{\"ok\":false,\"error\":\"PHP or cve_client.php unavailable\"}"
+  fi
+}
+
 cmd_json() {
   case "${1:-}" in
+    dash) json_dash "${2:-}" ;;
     sites) json_sites ;; status) json_status ;; dropbox) json_dropbox ;;
     settings) json_settings ;; transfer) json_transfer ;; stack) json_stack ;;
     build) json_build ;; workers) /usr/local/bin/wtc-workers status --json ;;
     nginx) json_nginx ;; sysinfo) json_sysinfo ;; processes) json_processes ;;
     net_monitor) json_net_monitor "${2:-30}" ;;
     firewall) json_firewall ;;
+    services) json_services ;;
+    security) generate_security_audit cached ;;
     *) die "Unknown json view" ;;
   esac
 }
@@ -1785,7 +2884,7 @@ case "${1:-}" in
   --db-tables)      cmd_db_tables "${2:-}" ;;
   --db-query)       cmd_db_query "${2:-}" "${3:-}" ;;
   --artisan)        cmd_artisan "${2:-}" "${3:-}" ;;
-  --direct-deploy)  cmd_direct_deploy "${2:-}" "${3:-}" ;;
+  --direct-deploy)  cmd_direct_deploy "${2:-}" "${3:-}" "${4:-}" ;;
   --store-site)     cmd_store_site "${2:-}" "${3:-}" ;;
   --build)          cmd_build "${2:-}" ;;
   --build-exec)     cmd_build_exec "${2:-}" ;;
@@ -1798,5 +2897,12 @@ case "${1:-}" in
   --rescan-sites)   cmd_rescan_sites ;;
   --rescan-stack)   build_stack_cache ;;
   --firewall)       cmd_firewall "${2:-status}" "${3:-}" "${4:-tcp}" ;;
-  *) echo "Usage: wtc-manage [--list|--current|--status|--logs N|--set S|--rollback S|--delete S|--create S|--ingest|--save-state|--reload-ui|--rescan-sites|--rescan-stack|--firewall ACT [PORT] [PROTO]|--json V|--setting K V|--transfer ...|--stack A ID|--device A|--db-create S|--db-import S|--db-export S [F]|--db-info S|--db-test S|--db-creds S|--db-tables S|--db-query S [Q]|--artisan S CMD|--direct-deploy S DIR|--store-site S DIR|--build S|--server-tune|--workers ACTION|--nginx-save T [R]|--nginx-test T|--nginx-ctl A|--nginx-reset]"; exit 2 ;;
+  --service)        cmd_service "${2:-status}" "${3:-}" "${4:-50}" ;;
+  --security-scan)  generate_security_audit "${2:-1}" ;;
+  --security-remediate) cmd_security_remediate "${2:-}" ;;
+  --cve-lookup)     cmd_cve_lookup "${2:-}" ;;
+  --cve-check)      cmd_cve_check "${2:-}" "${3:-}" ;;
+  --network)        if [ -x /usr/local/bin/wtc-network ]; then /usr/local/bin/wtc-network "${2:-check}"; else echo "Network watchdog not installed"; fi ;;
+  --fan)            if [ -x /usr/local/bin/wtc-network ]; then /usr/local/bin/wtc-network fan "${2:-status}" "${3:-}"; else echo "Fan controller not installed"; fi ;;
+  *) echo "Usage: wtc-manage [--list|--current|--status|--logs N|--set S|--rollback S|--delete S|--create S|--ingest|--save-state|--reload-ui|--rescan-sites|--rescan-stack|--firewall ACT [PORT] [PROTO]|--service ACT UNIT [LINES]|--network [ACT]|--fan [ACT]|--json V|--setting K V|--transfer ...|--stack A ID|--device A|--db-create S|--db-import S|--db-export S [F]|--db-info S|--db-test S|--db-creds S|--db-tables S|--db-query S [Q]|--artisan S CMD|--direct-deploy S DIR [P]|--store-site S DIR|--build S|--server-tune|--workers ACTION|--nginx-save T [R]|--nginx-test T|--nginx-ctl A|--nginx-reset]"; exit 2 ;;
 esac

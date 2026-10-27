@@ -97,6 +97,16 @@ cmd_run() {
         # Strip name prefix if Procfile format (e.g. "worker: php ...")
         cmd="${line#*:}"
         cmd="$(echo "$cmd" | sed -e 's/^[[:space:]]*//')"
+        # Security hardening: reject shell chaining, pipes, subshells or dangerous operators
+        if [[ "$cmd" =~ (\;|&&|\||\`|\$|<|>|\n|\r) ]]; then
+          log "Security alert: Rejected unsafe worker command containing shell operators: $cmd"
+          continue
+        fi
+        # Validate command runner starts with safe runtime
+        if ! [[ "$cmd" =~ ^(php|node|npm|python3|artisan)[[:space:]] ]]; then
+          log "Security alert: Custom worker command must start with php, node, npm, or python3: $cmd"
+          continue
+        fi
         su -s /bin/bash "$RUN_USER" -c "cd '$WWW_ROOT' && exec $cmd" >> "$LOG_FILE" 2>&1 &
         CPID=$!
         CHILD_PIDS+=("$CPID")

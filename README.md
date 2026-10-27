@@ -24,8 +24,10 @@ Enjoy blazing-fast response times, zero SD-card write exhaustion, instant drag-a
 * **🛡️ Zero-Downtime Atomic Swaps & Rollbacks**: New deployments unpack to staging, validate with `nginx -t`, and swap atomically. Roll back to the previous revision in one click.
 * **🛠️ Dual Management Interfaces**:
   * **Web Console**: Modern, responsive dashboard running on dedicated port `4485` (and `/manage/`).
-  * **Terminal CLI**: Interactive whiptail menu via `sudo wtc-manage`.
-* **⚙️ Built-in Tooling**: Integrated firewall manager (`ufw`), background queue daemon (`wtc-workers` for Laravel queue/scheduler), Nginx vhost editor, and 1-click stack installer (Redis, Node.js, Composer, etc.).
+* **⚙️ Built-in Tooling & Service Manager**:
+  * **Service Manager**: Dedicated web tab categorizing platform & web stack services belonging to us vs system/kernel daemons (`systemd-journald`, `systemd-udevd`, `systemd-resolved`, `cron`), with live controls (start, stop, restart, enable/disable) and journal log inspection.
+  * **Firewall & Security**: Integrated UFW firewall manager with 1-click port toggles.
+  * **Stack & Worker Daemons**: Background queue supervisor (`wtc-workers`), Nginx vhost editor, and 1-click stack installer.
 
 ---
 
@@ -208,6 +210,7 @@ To update your server scripts, management UI, and system services to the latest 
 ```bash
 cd PiLabWTC
 git pull
+chmod +x update.sh
 sudo ./update.sh
 ```
 

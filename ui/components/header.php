@@ -18,6 +18,7 @@ declare(strict_types=1);
     <style>
         <?= css() ?>
     </style>
+    <script src="/js/dash-live.js?v=<?= file_exists(__DIR__ . '/../js/dash-live.js') ? filemtime(__DIR__ . '/../js/dash-live.js') : time() ?>"></script>
     <script defer src="/js/spa.js?v=<?= filemtime(__DIR__ . '/../js/spa.js') ?>"></script>
 </head>
 

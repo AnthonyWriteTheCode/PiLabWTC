@@ -17,17 +17,17 @@ NO_RELOAD="${NO_RELOAD:-0}"
 
 # ensure_ramdisk is provided by common.sh
 
-restart_nginx() {
+reload_nginx() {
   [ "$NO_RELOAD" = "1" ] && return 0
   if systemctl is-active --quiet nginx; then
-    systemctl restart nginx 2>/dev/null || systemctl reload nginx 2>/dev/null || true
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
   else
     systemctl start nginx 2>/dev/null || true
   fi
 }
 
-reload_nginx() {
-  restart_nginx
+restart_nginx() {
+  reload_nginx
 }
 
 placeholder_site() {
@@ -83,8 +83,8 @@ activate_site() {
 
   log "Activating site '$site' (slug: $slug) in RAM disk at $site_dir..."
   mkdir -p "$site_dir"
-  # Unpack archive into dedicated site folder in RAM
-  if ! tar -xf "$archive" -C "$site_dir" --no-same-owner --no-same-permissions; then
+  # Unpack archive safely with ZipSlip & symlink defense
+  if ! safe_extract_archive "$archive" "$site_dir"; then
     rm -rf "$site_dir"; die "Failed to unpack $archive into $site_dir"
   fi
 
@@ -146,9 +146,11 @@ EOF
       cp -n "$site_dir/.env.example" "$site_dir/.env"
       db_write_files "$site" "$site_dir"
     fi
+    rm -f "$site_dir/bootstrap/cache/"*.php 2>/dev/null || true
     if [ -f "$site_dir/artisan" ]; then
       rm -f "$site_dir/public/storage" 2>/dev/null || true
       su -s /bin/bash "$WEB_USER" -c "php '$site_dir/artisan' storage:link --force" >> /var/log/wtc-web/service.log 2>&1 || true
+      su -s /bin/bash "$WEB_USER" -c "php '$site_dir/artisan' route:clear" >> /var/log/wtc-web/service.log 2>&1 || true
       su -s /bin/bash "$WEB_USER" -c "php '$site_dir/artisan' optimize:clear" >> /var/log/wtc-web/service.log 2>&1 || true
     fi
   fi
@@ -317,36 +319,53 @@ swap_site() {
   activate_site "$site" 1
 }
 
-# Swap a staged directory in RAM directly into www without tar/untar
+# Swap a staged directory in RAM directly into multi-site RAM host without tar/untar
 swap_dir() {
-  local site="$1" dir="$2" rel snippet_new old_rel old_snip
+  local site="$1" dir="$2" make_primary="${3:-}" slug site_dir webroot ng_err
   valid_name "$site" || die "Invalid site name: $site"
   [ -d "$dir" ] || die "Directory not found: $dir"
   ensure_ramdisk
 
-  rel="$RELEASES_DIR/$(date +%s)-$site"
-  mkdir -p "$rel"
-  cp -a "$dir"/. "$rel"/
+  slug="$(site_slug "$site")"
+  [ -n "$slug" ] || slug="site"
+  site_dir="$RAM_SITES_DIR/$slug"
+  mkdir -p "$RAM_SITES_DIR"
+
+  log "Swapping staged directory into RAM disk at $site_dir (site: $site, slug: $slug)..."
+
+  local tmp_target="$RAM_SITES_DIR/.$slug.new.$$"
+  rm -rf "$tmp_target"
+  mkdir -p "$tmp_target"
+  cp -a "$dir"/. "$tmp_target"/
+  preserve_existing_site_configs "$site" "$tmp_target"
 
   # Check if React build / dist folder is present and promote
   for sub in dist build out; do
-    if [ -d "$rel/$sub" ] && [ -f "$rel/$sub/index.html" ]; then
-      cp -rn "$rel/$sub"/* "$rel"/ 2>/dev/null || true
+    if [ -d "$tmp_target/$sub" ] && [ -f "$tmp_target/$sub/index.html" ]; then
+      cp -rn "$tmp_target/$sub"/* "$tmp_target"/ 2>/dev/null || true
       break
     fi
   done
 
+  # If React/Node project with package.json build script and no built index.*, trigger background build
+  if [ -f "$tmp_target/package.json" ] && grep -q '"build"' "$tmp_target/package.json" 2>/dev/null; then
+    if [ ! -f "$tmp_target/index.html" ] && [ ! -f "$tmp_target/index.php" ]; then
+      log "Site '$site' contains package.json build script - triggering background build job"
+      /usr/local/bin/wtc-manage --build "$site" >/dev/null 2>&1 &
+    fi
+  fi
+
   # Auto-create database & user if enabled, and inject connection helpers
   db_ensure "$site" || log "Database ensure for '$site' failed or MariaDB not running"
-  db_write_files "$site" "$rel"
+  db_write_files "$site" "$tmp_target"
 
   # Restore database if snapshot exists in the staged directory
   if db_available; then
     local db_dump_file=""
-    if [ -f "$rel/.wtc-database.sql" ]; then
-      db_dump_file="$rel/.wtc-database.sql"
-    elif [ -f "$rel/.wtc-db.sql" ]; then
-      db_dump_file="$rel/.wtc-db.sql"
+    if [ -f "$tmp_target/.wtc-database.sql" ]; then
+      db_dump_file="$tmp_target/.wtc-database.sql"
+    elif [ -f "$tmp_target/.wtc-db.sql" ]; then
+      db_dump_file="$tmp_target/.wtc-db.sql"
     fi
     if [ -n "$db_dump_file" ]; then
       local db_id; db_id="$(db_ident "$site")"
@@ -356,10 +375,11 @@ swap_dir() {
   fi
 
   # Check if Laravel application
-  if [ -f "$rel/artisan" ] || [ -f "$rel/public/index.php" ]; then
+  if [ -f "$tmp_target/artisan" ] || [ -f "$tmp_target/public/index.php" ]; then
     log "Laravel application detected for '$site' - preparing webroot & permissions"
-    if [ ! -f "$rel/index.php" ]; then
-      cat > "$rel/index.php" <<'EOF'
+    rm -f "$tmp_target/public/hot" 2>/dev/null || true
+    if [ ! -f "$tmp_target/index.php" ]; then
+      cat > "$tmp_target/index.php" <<'EOF'
 <?php
 // WTC Pi Laravel Gateway
 if (file_exists(__DIR__ . '/public/index.php')) {
@@ -367,97 +387,145 @@ if (file_exists(__DIR__ . '/public/index.php')) {
 }
 EOF
     fi
-    mkdir -p "$rel/storage/framework/cache/data" \
-             "$rel/storage/framework/sessions" \
-             "$rel/storage/framework/views" \
-             "$rel/storage/logs" \
-             "$rel/bootstrap/cache"
-    if [ ! -f "$rel/.env" ] && [ -f "$rel/.env.example" ]; then
-      cp -n "$rel/.env.example" "$rel/.env"
-      db_write_files "$site" "$rel"
+    mkdir -p "$tmp_target/storage/framework/cache/data" \
+             "$tmp_target/storage/framework/sessions" \
+             "$tmp_target/storage/framework/views" \
+             "$tmp_target/storage/logs" \
+             "$tmp_target/storage/app/public" \
+             "$tmp_target/bootstrap/cache"
+    rm -f "$tmp_target/bootstrap/cache/"*.php 2>/dev/null || true
+    if [ ! -f "$tmp_target/.env" ] && [ -f "$tmp_target/.env.example" ]; then
+      cp -n "$tmp_target/.env.example" "$tmp_target/.env"
+      db_write_files "$site" "$tmp_target"
     fi
-    if [ -f "$rel/artisan" ]; then
-      su -s /bin/bash "$WEB_USER" -c "php '$rel/artisan' storage:link" >> /var/log/wtc-web/service.log 2>&1 || true
-      su -s /bin/bash "$WEB_USER" -c "php '$rel/artisan' optimize:clear" >> /var/log/wtc-web/service.log 2>&1 || true
+    if [ -f "$tmp_target/artisan" ]; then
+      rm -f "$tmp_target/public/storage" 2>/dev/null || true
+      su -s /bin/bash "$WEB_USER" -c "php '$tmp_target/artisan' storage:link --force" >> /var/log/wtc-web/service.log 2>&1 || true
+      su -s /bin/bash "$WEB_USER" -c "php '$tmp_target/artisan' route:clear" >> /var/log/wtc-web/service.log 2>&1 || true
+      su -s /bin/bash "$WEB_USER" -c "php '$tmp_target/artisan' optimize:clear" >> /var/log/wtc-web/service.log 2>&1 || true
     fi
   fi
 
-  # Determine stack type and configure Nginx snippet in RAM drive
-  local stack
-  stack="$(detect_site_stack "$rel")"
-  snippet_new="$RAM_MOUNT/.snippet.new"
-  if [ -f "$rel/nginx.conf" ]; then
-    log "Site '$site' provides custom nginx.conf"
-    mv "$rel/nginx.conf" "$snippet_new"
-  else
-    log "Configuring Nginx in RAM disk for stack: '$stack' ($site)"
-    generate_stack_nginx_conf "$stack" "$rel" "$snippet_new"
-  fi
-
-  if [ ! -f "$rel/index.php" ]; then
-    cat > "$rel/index.php" <<'EOF'
+  if [ ! -f "$tmp_target/index.php" ]; then
+    cat > "$tmp_target/index.php" <<'EOF'
 <?php
-// WTC Gateway for Active RAM Disk Site
-if (file_exists(__DIR__ . '/public/index.php')) {
+// WTC Pi SPA Router Bridge & Fallback Gateway
+$rawUri = $_SERVER['REQUEST_URI'] ?? '/';
+$reqUri = parse_url($rawUri, PHP_URL_PATH) ?: '/';
+
+$prefix = $_SERVER['HTTP_X_FORWARDED_PREFIX'] ?? '';
+if ($prefix !== '' && str_starts_with($reqUri, $prefix)) {
+    $reqUri = substr($reqUri, strlen($prefix));
+} elseif (str_starts_with($reqUri, '/site')) {
+    $reqUri = substr($reqUri, 5);
+} elseif (preg_match('#^/([a-z0-9_-]+)(/.*)?$#i', $reqUri, $m)) {
+    $sub = '/' . ltrim((string)($m[2] ?? ''), '/');
+    if ($sub !== '/' && (is_file(__DIR__ . $sub) || is_file(__DIR__ . '/public' . $sub))) {
+        $reqUri = $sub;
+    }
+}
+$reqUri = '/' . ltrim((string)$reqUri, '/');
+
+$filePath = __DIR__ . $reqUri;
+if (!is_file($filePath) && is_file(__DIR__ . '/public' . $reqUri)) {
+    $filePath = __DIR__ . '/public' . $reqUri;
+}
+
+$ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest'], true);
+
+if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) {
+    $mimes = [
+        'js' => 'application/javascript', 'mjs' => 'application/javascript',
+        'css' => 'text/css', 'html' => 'text/html', 'htm' => 'text/html',
+        'json' => 'application/json', 'map' => 'application/json',
+        'svg' => 'image/svg+xml', 'png' => 'image/png', 'jpg' => 'image/jpeg',
+        'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp',
+        'ico' => 'image/x-icon', 'woff' => 'font/woff', 'woff2' => 'font/woff2',
+        'ttf' => 'font/ttf', 'eot' => 'application/vnd.ms-fontobject',
+        'wasm' => 'application/wasm'
+    ];
+    $mime = $mimes[$ext] ?? 'application/octet-stream';
+    header('Content-Type: ' . $mime);
+    readfile($filePath);
+    exit;
+}
+
+if ($isAsset) {
+    http_response_code(404);
+    header('Content-Type: text/plain');
+    echo "404 Asset Not Found: " . htmlspecialchars($reqUri);
+    exit;
+}
+
+if (file_exists(__DIR__ . '/public/index.php') && realpath(__DIR__ . '/public/index.php') !== realpath(__FILE__)) {
     require_once __DIR__ . '/public/index.php';
-} elseif (file_exists(__DIR__ . '/index.html')) {
+    exit;
+}
+
+if (is_file(__DIR__ . '/index.html')) {
     header('Content-Type: text/html; charset=utf-8');
     readfile(__DIR__ . '/index.html');
-} elseif (file_exists(__DIR__ . '/public/index.html')) {
+    exit;
+} elseif (is_file(__DIR__ . '/public/index.html')) {
     header('Content-Type: text/html; charset=utf-8');
     readfile(__DIR__ . '/public/index.html');
-} else {
-    http_response_code(404);
-    echo "WTC: No index file found in active RAM site.";
+    exit;
 }
+
+http_response_code(404);
+echo "404 Not Found";
 EOF
   fi
-  chown -R "$WEB_USER:$WEB_USER" "$rel"
-  chmod -R u=rwX,go=rX "$rel"
-  [ -d "$rel/storage" ] && chmod -R 775 "$rel/storage" "$rel/bootstrap/cache" 2>/dev/null || true
 
-  old_rel="$(readlink -f "$WWW_LINK" 2>/dev/null || true)"
-  old_snip="$RAM_MOUNT/.snippet.old"
-  if [ -f "$RAM_NGINX_CONF" ]; then cp -f "$RAM_NGINX_CONF" "$old_snip"; else : > "$old_snip"; fi
+  chown -R "$WEB_USER:$WEB_USER" "$tmp_target"
+  chmod -R u=rwX,go=rX "$tmp_target"
+  [ -d "$tmp_target/storage" ] && chmod -R 775 "$tmp_target/storage" "$tmp_target/bootstrap/cache" 2>/dev/null || true
 
-  # Establish correct project webroot (Laravel public/ directory vs standard site root)
-  local webroot="$rel"
-  if [ -d "$rel/public" ] && { [ -f "$rel/artisan" ] || [ -f "$rel/public/index.php" ]; }; then
-    webroot="$rel/public"
-    log "Setting project webroot to Laravel public/ directory: $webroot"
+  # Replace site_dir atomically
+  local old_site_dir="$RAM_SITES_DIR/.$slug.old.$$"
+  [ -d "$site_dir" ] && mv "$site_dir" "$old_site_dir"
+  mv "$tmp_target" "$site_dir"
+  rm -rf "$old_site_dir" 2>/dev/null || true
+
+  webroot="$site_dir"
+  if [ -d "$site_dir/public" ] && { [ -f "$site_dir/artisan" ] || [ -f "$site_dir/public/index.php" ]; }; then
+    webroot="$site_dir/public"
   fi
-  ln -sfn "$webroot" "$RAM_MOUNT/.webroot.new"
-  mv -T "$RAM_MOUNT/.webroot.new" "$RAM_MOUNT/webroot"
 
-  ln -sfn "$rel" "$RAM_MOUNT/.www.new"
-  mv -T "$RAM_MOUNT/.www.new" "$WWW_LINK"
-  install -m 0644 "$snippet_new" "$RAM_NGINX_CONF"
-  ln -sfn "$RAM_NGINX_CONF" "$NGINX_SNIPPET" 2>/dev/null || true
+  # Generate dedicated Port 80 location blocks for /<slug>/
+  generate_site_nginx_block "$site" "$slug" "$site_dir" "$webroot" "$RAM_NGINX_SITES/$slug.conf"
 
-  local ng_err
-  if ng_err="$(nginx -t 2>&1)"; then
-    restart_nginx
-  else
-    log "nginx -t failed for '$site' - reverting. Details: $ng_err"
-    install -m 0644 "$old_snip" "$RAM_NGINX_CONF"
+  # If this site should be the primary site (or no primary site exists, or site was already primary)
+  local cur_primary
+  cur_primary="$(active_site)"
+  if [ "$make_primary" = "1" ] || [ -z "$cur_primary" ] || [ "$cur_primary" = "$site" ] || [ ! -d "$RAM_SITES_DIR/$(site_slug "$cur_primary")" ]; then
+    ln -sfn "$webroot" "$RAM_MOUNT/.webroot.new"
+    mv -T "$RAM_MOUNT/.webroot.new" "$RAM_MOUNT/webroot"
+    ln -sfn "$site_dir" "$RAM_MOUNT/.www.new"
+    mv -T "$RAM_MOUNT/.www.new" "$WWW_LINK"
+    local stack; stack="$(detect_site_stack "$site_dir")"
+    generate_stack_nginx_conf "$stack" "$site_dir" "$RAM_NGINX_CONF"
     ln -sfn "$RAM_NGINX_CONF" "$NGINX_SNIPPET" 2>/dev/null || true
-    if [ -n "$old_rel" ] && [ -d "$old_rel" ]; then
-      ln -sfn "$old_rel" "$RAM_MOUNT/.www.new"
-      mv -T "$RAM_MOUNT/.www.new" "$WWW_LINK"
-      local old_webroot="$old_rel"
-      [ -d "$old_rel/public" ] && old_webroot="$old_rel/public"
-      ln -sfn "$old_webroot" "$RAM_MOUNT/.webroot.new"
-      mv -T "$RAM_MOUNT/.webroot.new" "$RAM_MOUNT/webroot"
-    fi
-    rm -rf "$rel"
-    die "Swap to '$site' aborted: invalid nginx configuration"
+    echo "$site" > "$STATE_FILE"
+    log "Set primary site to '$site' (slug: $slug)"
   fi
 
-  find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 ! -path "$rel" -exec rm -rf {} +
-  rm -f "$snippet_new" "$old_snip"
-  echo "$site" > "$STATE_FILE"
+  # Test Nginx if not during boot
+  if [ "$NO_RELOAD" != "1" ]; then
+    if ng_err="$(nginx -t 2>&1)"; then
+      restart_nginx
+    else
+      log "nginx -t failed for '$site' direct swap - reverting. Details: $ng_err"
+      rm -f "$RAM_NGINX_SITES/$slug.conf"
+      rm -rf "$site_dir"
+      die "Swap of '$site' aborted: invalid nginx configuration"
+    fi
+  fi
+
+  add_active_site "$site"
   date +%s > "$SAVE_STAMP"
-  log "Active site is now '$site' (direct RAM swap, stack: $stack)"
+  log "Site '$site' is now live at /$slug/ and active in RAM (direct swap)"
   if [ -x /usr/local/bin/wtc-workers ]; then
     /usr/local/bin/wtc-workers restart >> /var/log/wtc-web/service.log 2>&1 || true
   fi
@@ -511,7 +579,7 @@ save_state() {
   [ -d "$live" ] || die "Site '$site' is not active in RAM disk"
 
   tmp="$(mktemp -d "$RAM_MOUNT/.save.XXXXXX")"
-  tar -xf "$archive" -C "$tmp" --no-same-owner --no-same-permissions
+  safe_extract_archive "$archive" "$tmp"
   persist=""
   if [ -f "$live/wtc.json" ] && command -v jq >/dev/null; then
     persist="$(jq -r '.persist[]? // empty' "$live/wtc.json" 2>/dev/null || true)"
@@ -815,13 +883,16 @@ EOF
 
   if [ "$EXISTED" -eq 1 ]; then
     log "UPDATED site '$name' from $base"
-    if [ "$AUTO_RELOAD_ACTIVE" = yes ] && [ "$(active_site)" = "$name" ]; then
-      "$SERVICE_BIN" --swap "$name" || log "Hot reload of '$name' failed"
+    if [ "$AUTO_RELOAD_ACTIVE" = yes ] && is_site_active "$name"; then
+      local is_prim=0; [ "$(active_site)" = "$name" ] && is_prim=1
+      "$SERVICE_BIN" --activate "$name" "$is_prim" || log "Hot reload of '$name' failed"
     fi
   else
     log "NEW site '$name' from $base"
     if [ "$AUTO_ACTIVATE_NEW" = yes ]; then
-      "$SERVICE_BIN" --swap "$name" || log "Auto-activate of '$name' failed"
+      local cur_p; cur_p="$(active_site)"
+      local make_p=1; [ -n "$cur_p" ] && [ "$cur_p" != "$name" ] && make_p=0
+      "$SERVICE_BIN" --activate "$name" "$make_p" || log "Auto-activate of '$name' failed"
     fi
   fi
 }
@@ -1034,12 +1105,17 @@ EOF
 
   if [ "$EXISTED" -eq 1 ]; then
     log "UPDATED site '$name' from folder $base"
-    if [ "$AUTO_RELOAD_ACTIVE" = yes ] && [ "$(active_site)" = "$name" ]; then
-      "$SERVICE_BIN" --swap "$name" || log "Hot reload of '$name' failed"
+    if [ "$AUTO_RELOAD_ACTIVE" = yes ] && is_site_active "$name"; then
+      local is_prim=0; [ "$(active_site)" = "$name" ] && is_prim=1
+      "$SERVICE_BIN" --activate "$name" "$is_prim" || log "Hot reload of '$name' failed"
     fi
   else
     log "NEW site '$name' from folder $base - auto-spinning up live"
-    "$SERVICE_BIN" --swap "$name" || log "Auto-spin-up of '$name' failed"
+    if [ "$AUTO_ACTIVATE_NEW" = yes ]; then
+      local cur_p; cur_p="$(active_site)"
+      local make_p=1; [ -n "$cur_p" ] && [ "$cur_p" != "$name" ] && make_p=0
+      "$SERVICE_BIN" --activate "$name" "$make_p" || log "Auto-spin-up of '$name' failed"
+    fi
   fi
 }
 
@@ -1078,13 +1154,13 @@ main() {
     --activate|--enable-site) [ -n "${2:-}" ] || die "Usage: $0 --activate <site> [primary:0|1]"; activate_site "$2" "${3:-1}" ;;
     --deactivate|--disable-site) [ -n "${2:-}" ] || die "Usage: $0 --deactivate <site>"; deactivate_site "$2" ;;
     --swap)       [ -n "${2:-}" ] || die "Usage: $0 --swap <site>"; swap_site "$2" ;;
-    --swap-dir)   [ -n "${2:-}" ] && [ -n "${3:-}" ] || die "Usage: $0 --swap-dir <site> <dir>"; swap_dir "$2" "$3" ;;
+    --swap-dir)   [ -n "${2:-}" ] && [ -n "${3:-}" ] || die "Usage: $0 --swap-dir <site> <dir> [primary:0|1]"; swap_dir "$2" "$3" "${4:-}" ;;
     --reload)     swap_site "$(active_site)" ;;
     --ingest)     ingest ;;
     --save-state) save_state "${2:-}" ;;
     --save-tick)  save_tick ;;
     --shutdown)   [ "$SAVE_ON_SHUTDOWN" = yes ] && save_state || true; [ -x /usr/local/bin/wtc-workers ] && /usr/local/bin/wtc-workers stop || true ;;
-    *) echo "Usage: $0 --boot|--reload-ui|--activate S [P]|--deactivate S|--swap S|--swap-dir S D|--reload|--ingest|--save-state [S]|--save-tick|--shutdown" >&2; exit 2 ;;
+    *) echo "Usage: $0 --boot|--reload-ui|--activate S [P]|--deactivate S|--swap S|--swap-dir S D [P]|--reload|--ingest|--save-state [S]|--save-tick|--shutdown" >&2; exit 2 ;;
   esac
 }
 main "$@"

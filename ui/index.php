@@ -15,6 +15,7 @@ const MAX_UPLOAD = 1024 * 1024 * 1024; // 1GB
 
 require_once __DIR__ . '/components/stacks.php';
 require_once __DIR__ . '/components/db_helper.php';
+require_once __DIR__ . '/components/cve_client.php';
 
 session_name('wtcui');
 session_set_cookie_params(['httponly' => true, 'samesite' => 'Strict', 'path' => '/']);
@@ -66,9 +67,12 @@ function is_spa_request(): bool
 }
 function go(string $page): never
 {
+    $flash = $_SESSION['flash'] ?? null;
+    unset($_SESSION['flash']);
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
     if (is_spa_request()) {
-        $flash = $_SESSION['flash'] ?? null;
-        unset($_SESSION['flash']);
         header('Content-Type: application/json');
         echo json_encode([
             'ok' => true,
@@ -76,9 +80,15 @@ function go(string $page): never
             'redirect' => str_starts_with($page, '/') ? $page : ('/?p=' . urlencode($page)),
             'flash' => $flash ? ['type' => $flash[0], 'msg' => $flash[1]] : null
         ]);
+        if (function_exists('fastcgi_finish_request')) {
+            fastcgi_finish_request();
+        }
         exit;
     }
     header('Location: ' . (str_starts_with($page, '/') ? $page : ('/?p=' . urlencode($page))));
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+    }
     exit;
 }
 function fmt_bytes(int|float $b): string
@@ -142,6 +152,80 @@ function valid_site(string $s): bool
 {
     return (bool) preg_match('/^[a-z0-9][a-z0-9_-]{0,62}$/', $s);
 }
+
+/**
+ * Safely extract an archive into a destination directory with strict ZipSlip and symlink traversal defense.
+ */
+function safe_php_extract(string $archiveFile, string $destDir, string $rawName): void
+{
+    if (!is_file($archiveFile)) {
+        throw new RuntimeException("Uploaded archive file not found: $rawName");
+    }
+    if (!is_dir($destDir)) {
+        @mkdir($destDir, 0775, true);
+    }
+
+    if (preg_match('/\.zip$/i', $rawName)) {
+        $zip = new ZipArchive();
+        if ($zip->open($archiveFile) !== true) {
+            exec('/usr/bin/unzip -qo ' . escapeshellarg($archiveFile) . ' -d ' . escapeshellarg($destDir), $uOut, $uRc);
+            if ($uRc !== 0) {
+                throw new RuntimeException('Failed to extract zip archive');
+            }
+        } else {
+            // Pre-audit: Reject ZipSlip
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $stat = $zip->statIndex($i);
+                $name = $stat['name'] ?? '';
+                if (str_contains($name, '../') || str_starts_with($name, '/') || str_starts_with($name, '\\')) {
+                    $zip->close();
+                    throw new RuntimeException("Archive rejected: Malicious path traversal ('$name') detected in zip archive.");
+                }
+            }
+            $zip->extractTo($destDir);
+            $zip->close();
+        }
+    } else {
+        // Tar archive: check listing
+        exec('/bin/tar -tf ' . escapeshellarg($archiveFile) . ' 2>/dev/null', $listOut, $listRc);
+        if ($listRc === 0 && !empty($listOut)) {
+            foreach ($listOut as $line) {
+                $line = trim($line);
+                if (str_contains($line, '../') || str_starts_with($line, '/')) {
+                    throw new RuntimeException("Archive rejected: Malicious path traversal ('$line') detected in tar archive.");
+                }
+            }
+        }
+        exec('/bin/tar -xf ' . escapeshellarg($archiveFile) . ' -C ' . escapeshellarg($destDir) . ' --no-same-owner --no-same-permissions', $tOut, $tRc);
+        if ($tRc !== 0) {
+            throw new RuntimeException('Failed to extract tar archive');
+        }
+    }
+
+    // Post-audit: Remove any dangerous symlinks pointing outside destDir
+    $realDest = realpath($destDir) ?: $destDir;
+    if (is_dir($destDir)) {
+        try {
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($destDir, FilesystemIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::CHILD_FIRST
+            );
+            foreach ($iterator as $item) {
+                if ($item->isLink()) {
+                    $linkTarget = @readlink($item->getPathname());
+                    $resolved = @realpath($item->getPathname());
+                    if ($linkTarget !== false) {
+                        if (str_starts_with($linkTarget, '/') || !$resolved || !str_starts_with($resolved, $realDest)) {
+                            @unlink($item->getPathname());
+                        }
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // Directory iterator error fallback
+        }
+    }
+}
 function backend_msg(array $r, string $ok): void
 {
     if ($r[0] === 0) {
@@ -164,6 +248,251 @@ function backend_msg(array $r, string $ok): void
         $err = preg_replace('/^\S+ \S+ \[[^\]]+\] (?:ERROR:\s*)?/', '', $err);
     }
     flash('err', 'Failed: ' . ($err !== '' ? $err : 'see log'));
+}
+
+/**
+ * Match a relative file path against glob/wildcard patterns.
+ * Supports exact matches, prefix/directory wildcards (foo/**, foo/*, foo/), and fnmatch globs.
+ */
+function matches_protect_pattern(string $relPath, array $patterns): bool
+{
+    $relPath = ltrim(str_replace('\\', '/', $relPath), '/');
+    foreach ($patterns as $pattern) {
+        $pattern = trim(ltrim(str_replace('\\', '/', $pattern), '/'));
+        if ($pattern === '')
+            continue;
+        if ($relPath === $pattern)
+            return true;
+        if (str_ends_with($pattern, '/**')) {
+            $prefix = substr($pattern, 0, -3);
+            if (str_starts_with($relPath, $prefix . '/') || $relPath === $prefix)
+                return true;
+        }
+        if (str_ends_with($pattern, '/*')) {
+            $prefix = substr($pattern, 0, -2);
+            if (str_starts_with($relPath, $prefix . '/'))
+                return true;
+        }
+        if (str_ends_with($pattern, '/')) {
+            if (str_starts_with($relPath, $pattern))
+                return true;
+        }
+        if (fnmatch($pattern, $relPath, FNM_PATHNAME | FNM_PERIOD) || fnmatch($pattern, basename($relPath), FNM_PERIOD)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Parse .gitignore or .wtcignore lines into an array of clean patterns.
+ */
+function parse_ignore_patterns(string $filePath): array
+{
+    if (!is_file($filePath))
+        return [];
+    $lines = file($filePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+    $patterns = [];
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '' || str_starts_with($line, '#') || str_starts_with($line, '!'))
+            continue;
+        $patterns[] = ltrim($line, '/');
+    }
+    return $patterns;
+}
+
+/**
+ * Protect and preserve existing working site configurations (.env, database credentials,
+ * SQLite databases, database backups, media uploads, and user-specified protected patterns)
+ * so that re-uploading an archive or dropping project files does not overwrite them.
+ */
+function apply_site_protection(string $siteName, string $stageDir, array $userPatterns = [], string $envContent = ''): array
+{
+    $slug = strtolower((string) preg_replace('/[^a-z0-9_-]/', '', $siteName));
+    $liveRamDir = '/mnt/ramdisk/sites/' . $slug;
+    $existingArchive = SITES_DIR . '/' . $siteName . '.tar.gz';
+    $existingSlugArchive = SITES_DIR . '/' . $slug . '.tar.gz';
+
+    $sourceDir = null;
+    $tempInspectDir = null;
+
+    if (is_dir($liveRamDir)) {
+        $sourceDir = $liveRamDir;
+    } elseif (is_file($existingArchive) || is_file($existingSlugArchive)) {
+        $archivePath = is_file($existingArchive) ? $existingArchive : $existingSlugArchive;
+        $tempInspectDir = STAGE_DIR . '/.inspect-' . $slug . '-' . bin2hex(random_bytes(4));
+        try {
+            safe_php_extract($archivePath, $tempInspectDir, basename($archivePath));
+            if (is_dir($tempInspectDir)) {
+                $sourceDir = $tempInspectDir;
+            }
+        } catch (Throwable $e) {
+            // Ignore extraction errors during protection check
+        }
+    }
+
+    // Default core patterns protected across all stacks
+    $allPatterns = [
+        '.env',
+        '.env.*',
+        '.wtc-database.sql',
+        '.wtc-db.sql',
+        '.wtc-db.php',
+        'nginx.conf',
+        'wtc.json',
+        'wp-config.php',
+        'database/*.sqlite',
+        '*.sqlite',
+        '*.db',
+        'storage/app/**',
+    ];
+
+    // Merge user-specified patterns
+    foreach ($userPatterns as $up) {
+        $up = trim((string) $up);
+        if ($up !== '' && !in_array($up, $allPatterns, true)) {
+            $allPatterns[] = $up;
+        }
+    }
+
+    // Inspect .gitignore and .wtcignore if present in stageDir or existing site
+    $ignoreFiles = [
+        $stageDir . '/.gitignore',
+        $stageDir . '/.wtcignore',
+    ];
+    if ($sourceDir) {
+        $ignoreFiles[] = $sourceDir . '/.gitignore';
+        $ignoreFiles[] = $sourceDir . '/.wtcignore';
+    }
+    foreach ($ignoreFiles as $ig) {
+        if (is_file($ig)) {
+            foreach (parse_ignore_patterns($ig) as $ip) {
+                if (preg_match('/(\.env|\.sql|\.sqlite|\.db|storage|config|secret|key|upload)/i', $ip)) {
+                    if (!in_array($ip, $allPatterns, true)) {
+                        $allPatterns[] = $ip;
+                    }
+                }
+            }
+        }
+    }
+
+    // Save .wtc-protected.json into stageDir so bash backend (store_dir_as_site) also adheres to it
+    @file_put_contents($stageDir . '/.wtc-protected.json', json_encode(array_values(array_unique($allPatterns)), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+    $restoredFiles = [];
+
+    // If there is an existing site to preserve from
+    if ($sourceDir && is_dir($sourceDir)) {
+        // 1. Preserve & Merge .env
+        $liveEnvPath = $sourceDir . '/.env';
+        if ($envContent === '') {
+            if (is_file($liveEnvPath)) {
+                $liveEnv = (string) file_get_contents($liveEnvPath);
+                if (!is_file($stageDir . '/.env')) {
+                    // Upload had no .env -> preserve existing working server .env completely
+                    file_put_contents($stageDir . '/.env', $liveEnv);
+                    $restoredFiles[] = '.env (Restored from server)';
+                } else {
+                    // Upload had its own .env -> Server .env is authoritative!
+                    // Retain server's working keys (database credentials, APP_KEY, etc.), only appending genuinely new keys
+                    $stagedEnv = (string) file_get_contents($stageDir . '/.env');
+                    $merged = $liveEnv;
+                    $stagedLines = explode("\n", $stagedEnv);
+                    $newKeysAppended = 0;
+                    foreach ($stagedLines as $sLine) {
+                        $trimmed = trim($sLine);
+                        if ($trimmed === '' || str_starts_with($trimmed, '#'))
+                            continue;
+                        if (!str_contains($trimmed, '='))
+                            continue;
+                        $k = trim(explode('=', $trimmed, 2)[0]);
+                        if (!preg_match('/^[A-Za-z0-9_]+$/', $k))
+                            continue;
+                        if (!preg_match('/^' . preg_quote($k, '/') . '=/m', $liveEnv)) {
+                            $merged .= "\n" . $trimmed;
+                            $newKeysAppended++;
+                        }
+                    }
+                    file_put_contents($stageDir . '/.env', $merged);
+                    $restoredFiles[] = '.env (Server credentials protected' . ($newKeysAppended > 0 ? ", +$newKeysAppended new keys appended" : '') . ')';
+                }
+            }
+        } else {
+            file_put_contents($stageDir . '/.env', $envContent);
+        }
+
+        // 2. Preserve .wtc-db.php
+        if (is_file($sourceDir . '/.wtc-db.php') && !is_file($stageDir . '/.wtc-db.php')) {
+            @copy($sourceDir . '/.wtc-db.php', $stageDir . '/.wtc-db.php');
+            $restoredFiles[] = '.wtc-db.php';
+        }
+
+        // 3. Preserve database snapshot dump (.wtc-database.sql / .wtc-db.sql)
+        if (is_file($sourceDir . '/.wtc-database.sql') && !is_file($stageDir . '/.wtc-database.sql')) {
+            @copy($sourceDir . '/.wtc-database.sql', $stageDir . '/.wtc-database.sql');
+            $restoredFiles[] = '.wtc-database.sql';
+        } elseif (is_file($sourceDir . '/.wtc-db.sql') && !is_file($stageDir . '/.wtc-db.sql')) {
+            @copy($sourceDir . '/.wtc-db.sql', $stageDir . '/.wtc-db.sql');
+            $restoredFiles[] = '.wtc-db.sql';
+        }
+
+        // 4. Preserve SQLite databases
+        $sqliteGlobs = ['database/database.sqlite', 'database/*.sqlite', 'storage/*.sqlite', '*.sqlite', '*.db'];
+        foreach ($sqliteGlobs as $sg) {
+            $matched = glob($sourceDir . '/' . $sg) ?: [];
+            foreach ($matched as $mPath) {
+                $rel = ltrim(substr($mPath, strlen($sourceDir)), '/');
+                $target = $stageDir . '/' . $rel;
+                if (!is_file($target) || filesize($target) === 0) {
+                    @mkdir(dirname($target), 0775, true);
+                    @copy($mPath, $target);
+                    $restoredFiles[] = $rel;
+                }
+            }
+        }
+
+        // 5. Preserve user uploads & persisted media (storage/app)
+        if (is_dir($sourceDir . '/storage/app')) {
+            @mkdir($stageDir . '/storage/app', 0775, true);
+            exec('/bin/cp -rn ' . escapeshellarg($sourceDir . '/storage/app') . '/* ' . escapeshellarg($stageDir . '/storage/app') . '/ 2>/dev/null');
+            $restoredFiles[] = 'storage/app/**';
+        }
+
+        // 6. Check all remaining custom/protected patterns against existing files
+        try {
+            $iter = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($sourceDir, FilesystemIterator::SKIP_DOTS | FilesystemIterator::CURRENT_AS_FILEINFO),
+                RecursiveIteratorIterator::SELF_FIRST
+            );
+            foreach ($iter as $item) {
+                if ($item->isFile()) {
+                    $rel = ltrim(str_replace('\\', '/', substr($item->getPathname(), strlen($sourceDir))), '/');
+                    if (matches_protect_pattern($rel, $allPatterns)) {
+                        $target = $stageDir . '/' . $rel;
+                        if (!is_file($target) || filesize($target) === 0) {
+                            @mkdir(dirname($target), 0775, true);
+                            @copy($item->getPathname(), $target);
+                            if (!in_array($rel, $restoredFiles, true)) {
+                                $restoredFiles[] = $rel;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // directory iterator safety
+        }
+    }
+
+    if ($tempInspectDir && is_dir($tempInspectDir)) {
+        exec('/bin/rm -rf ' . escapeshellarg($tempInspectDir));
+    }
+
+    return [
+        'patterns' => $allPatterns,
+        'restored' => $restoredFiles,
+    ];
 }
 
 /* ------------------------------------------------------------ actions (POST) */
@@ -254,6 +583,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 flash('err', 'Could not save archive into RAM tmpfs');
                 go($back);
             }
+            if (!empty($_POST['protected_patterns'])) {
+                $up = is_array($_POST['protected_patterns']) ? $_POST['protected_patterns'] : json_decode((string) $_POST['protected_patterns'], true);
+                if (is_array($up)) {
+                    @file_put_contents(STAGE_DIR . '/.wtc-protected.json', json_encode(array_values(array_unique($up)), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+                }
+            }
             [$rc, $out, $err] = wtc(['--store-site', $siteName, $dest]);
             if ($rc === 0) {
                 flash('ok', "Uploaded '$siteName' and saved package to sites repository");
@@ -266,6 +601,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $v = (string) ($_POST['value'] ?? '');
             backend_msg(wtc(['--setting', $k, $v]), "$k updated");
             go($back);
+        case 'fan_test':
+            $duration = (string) ($_POST['duration'] ?? '5');
+            backend_msg(wtc(['--fan', 'test', $duration]), "Tested fan alert for {$duration}s");
+            go('settings');
         case 'transfer':
             $w = (string) ($_POST['what'] ?? '');
             $v = (string) ($_POST['value'] ?? '');
@@ -286,6 +625,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $detectedStack = (string) ($_POST['detected_stack'] ?? '');
             $envContent = (string) ($_POST['env_content'] ?? '');
             $deployMode = (string) ($_POST['deploy_mode'] ?? 'auto');
+            $userProtectedPatterns = [];
+            if (!empty($_POST['protected_patterns'])) {
+                if (is_array($_POST['protected_patterns'])) {
+                    $userProtectedPatterns = $_POST['protected_patterns'];
+                } else {
+                    $decoded = json_decode((string) $_POST['protected_patterns'], true);
+                    $userProtectedPatterns = is_array($decoded) ? $decoded : array_filter(array_map('trim', explode("\n", (string) $_POST['protected_patterns'])));
+                }
+            }
 
             try {
                 $f = $_FILES['archive'] ?? null;
@@ -318,21 +666,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         throw new RuntimeException('Could not save uploaded archive into RAM staging');
                     }
 
-                    if (preg_match('/\.zip$/i', $rawName)) {
-                        $zip = new ZipArchive();
-                        if ($zip->open($destArchive) === true) {
-                            $zip->extractTo($stageDir);
-                            $zip->close();
-                        } else {
-                            exec('/usr/bin/unzip -qo ' . escapeshellarg($destArchive) . ' -d ' . escapeshellarg($stageDir), $uOut, $uRc);
-                            if ($uRc !== 0)
-                                throw new RuntimeException('Failed to extract zip archive');
-                        }
-                    } else {
-                        exec('/bin/tar -xf ' . escapeshellarg($destArchive) . ' -C ' . escapeshellarg($stageDir) . ' --no-same-owner --no-same-permissions', $tOut, $tRc);
-                        if ($tRc !== 0)
-                            throw new RuntimeException('Failed to extract tar archive');
-                    }
+                    // Unpack safely with ZipSlip & symlink defense
+                    safe_php_extract($destArchive, $stageDir, $rawName);
                     @unlink($destArchive);
 
                     // Unwrap single top-level directory if present (e.g. zipped folder containing app/, public/, etc.)
@@ -417,10 +752,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     throw new RuntimeException('No files or folder detected in drop');
                 }
 
-                // If .env content was configured by the user, save it
-                if ($envContent !== '') {
-                    file_put_contents($stageDir . '/.env', $envContent);
-                }
+                // Apply comprehensive site protection: preserve .env (authoritative DB creds & APP_KEY),
+                // database seeders/dumps, SQLite DBs, storage/app, and user/gitignore protected patterns
+                $protResult = apply_site_protection($siteName, $stageDir, $userProtectedPatterns, $envContent);
 
                 // If Laravel or public/index.php is detected
                 if ($detectedStack === 'laravel' || is_file($stageDir . '/public/index.php')) {
@@ -483,31 +817,86 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     file_put_contents($stageDir . '/index.html', "<!doctype html><html><head><meta charset=\"utf-8\"><title>" . h($siteName) . "</title></head><body><h1>" . h($siteName) . "</h1><p>Site loaded directly in RAM.</p></body></html>");
                 }
 
-                if ($spinUp) {
-                    [$rc, $out, $err] = wtc(['--direct-deploy', $siteName, $stageDir]);
+                $isUpdate = is_file(SITES_DIR . '/' . $siteName . '.tar.gz');
+                $statusData = wj('status');
+                $curPrimary = (string) ($statusData['active'] ?? '');
+                $isCurrentlyPrimary = ($curPrimary === $siteName || $curPrimary === '');
+                $isCurrentlyActive = $isCurrentlyPrimary;
+                if (!$isCurrentlyActive) {
+                    $allSites = wj('sites');
+                    foreach ($allSites as $s) {
+                        if (($s['name'] ?? '') === $siteName && !empty($s['active'])) {
+                            $isCurrentlyActive = true;
+                            break;
+                        }
+                    }
+                }
+                $shouldDeployLive = $spinUp || $isCurrentlyActive;
+                $makePrimary = ($isCurrentlyPrimary || !empty($_POST['primary'])) ? '1' : '0';
+
+                if ($shouldDeployLive) {
+                    [$rc, $out, $err] = wtc(['--direct-deploy', $siteName, $stageDir, $makePrimary]);
                     if ($rc !== 0)
                         throw new RuntimeException("Backend deployment failed: " . ($err !== '' ? $err : $out));
 
+                    $siteSlug = strtolower((string) preg_replace('/[^a-z0-9_-]/', '', $siteName));
+                    $isArtisanApp = (!empty($_POST['detected_stack']) && $_POST['detected_stack'] === 'laravel') ||
+                                    is_file('/mnt/ramdisk/webroot/artisan') ||
+                                    is_file('/mnt/ramdisk/sites/' . $siteSlug . '/artisan') ||
+                                    is_file('/mnt/ramdisk/sites/' . $siteName . '/artisan');
+
+                    $runRouteClear = isset($_POST['run_route_clear']) ? !empty($_POST['run_route_clear']) : $isArtisanApp;
+                    $runOptimizeClear = isset($_POST['run_optimize_clear']) ? !empty($_POST['run_optimize_clear']) : $isArtisanApp;
+                    $runStorageLink = isset($_POST['run_storage_link']) ? !empty($_POST['run_storage_link']) : $isArtisanApp;
                     $runMigrations = !empty($_POST['run_migrations']);
                     $runSeeds = !empty($_POST['run_seeds']);
                     $artisanLog = [];
 
-                    if ($runMigrations) {
-                        [$mRc, $mOut, $mErr] = wtc(['--artisan', $siteName, 'migrate --force']);
-                        $artisanLog[] = [
-                            'command' => 'php artisan migrate --force',
-                            'ok' => ($mRc === 0),
-                            'output' => trim($mOut !== '' ? $mOut : $mErr)
-                        ];
-                    }
+                    if ($isArtisanApp || $runRouteClear || $runOptimizeClear || $runStorageLink || $runMigrations || $runSeeds) {
+                        if ($runStorageLink) {
+                            [$stRc, $stOut, $stErr] = wtc(['--artisan', $siteName, 'storage:link --force']);
+                            $artisanLog[] = [
+                                'command' => 'php artisan storage:link --force',
+                                'ok' => ($stRc === 0),
+                                'output' => trim($stOut !== '' ? $stOut : $stErr)
+                            ];
+                        }
 
-                    if ($runSeeds) {
-                        [$sRc, $sOut, $sErr] = wtc(['--artisan', $siteName, 'db:seed --force']);
-                        $artisanLog[] = [
-                            'command' => 'php artisan db:seed --force',
-                            'ok' => ($sRc === 0),
-                            'output' => trim($sOut !== '' ? $sOut : $sErr)
-                        ];
+                        if ($runRouteClear) {
+                            [$rRc, $rOut, $rErr] = wtc(['--artisan', $siteName, 'route:clear']);
+                            $artisanLog[] = [
+                                'command' => 'php artisan route:clear',
+                                'ok' => ($rRc === 0),
+                                'output' => trim($rOut !== '' ? $rOut : $rErr)
+                            ];
+                        }
+
+                        if ($runOptimizeClear) {
+                            [$oRc, $oOut, $oErr] = wtc(['--artisan', $siteName, 'optimize:clear']);
+                            $artisanLog[] = [
+                                'command' => 'php artisan optimize:clear',
+                                'ok' => ($oRc === 0),
+                                'output' => trim($oOut !== '' ? $oOut : $oErr)
+                            ];
+                        }
+
+                        if ($runMigrations) {
+                            [$mRc, $mOut, $mErr] = wtc(['--artisan', $siteName, 'migrate --force']);
+                            $artisanLog[] = [
+                                'command' => 'php artisan migrate --force',
+                                'ok' => ($mRc === 0),
+                                'output' => trim($mOut !== '' ? $mOut : $mErr)
+                            ];
+                        }
+
+                        if ($runSeeds) {
+                            [$sRc, $sOut, $sErr] = wtc(['--artisan', $siteName, 'db:seed --force']);
+                            $artisanLog[] = [
+                                'command' => 'php artisan db:seed --force',
+                                'ok' => ($sRc === 0),
+                                'output' => trim($sOut !== '' ? $sOut : $sErr)
+                            ];
+                        }
                     }
 
                 } else {
@@ -518,14 +907,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 if ($isAjax) {
                     $dbInfo = json_decode(wtc(['--db-info', $siteName])[1] ?? '', true) ?: [];
+                    $siteSlug = strtolower((string) preg_replace('/[^a-z0-9_-]/', '', $siteName));
+                    $liveUrl = ($makePrimary === '1') ? site_url('/') : site_url('/' . $siteSlug . '/');
                     header('Content-Type: application/json');
                     echo json_encode([
                         'ok' => true,
                         'site' => $siteName,
-                        'spun_up' => $spinUp,
-                        'url' => site_url('/'),
+                        'is_update' => $isUpdate,
+                        'spun_up' => $shouldDeployLive,
+                        'is_primary' => ($makePrimary === '1'),
+                        'url' => $liveUrl,
                         'db' => $dbInfo,
-                        'artisan_log' => $artisanLog ?? []
+                        'artisan_log' => $artisanLog ?? [],
+                        'protected_patterns' => $protResult['patterns'] ?? [],
+                        'restored_files' => $protResult['restored'] ?? []
                     ]);
                     exit;
                 }
@@ -533,7 +928,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!empty($artisanLog)) {
                     $artisanSummary = ' (' . implode(', ', array_map(fn($a) => $a['command'] . ': ' . ($a['ok'] ? 'OK' : 'Error'), $artisanLog)) . ')';
                 }
-                flash('ok', "Site '$siteName' uploaded" . ($spinUp ? " and active in RAM!" : "") . $artisanSummary);
+                $actionWord = $isUpdate ? 'updated' : 'uploaded';
+                flash('ok', "Site '$siteName' $actionWord" . ($shouldDeployLive ? " and active in RAM!" : "") . $artisanSummary);
                 go($back);
 
             } catch (\Throwable $e) {
@@ -552,16 +948,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $statusData = wj('status');
                 $site = (string) ($statusData['active'] ?? '');
             }
-            $cmd = (string) ($_POST['cmd'] ?? '');
+            $cmd = trim((string) ($_POST['cmd'] ?? ''));
             $runMigrations = !empty($_POST['run_migrations']);
             $runSeeds = !empty($_POST['run_seeds']);
             $runFresh = !empty($_POST['run_fresh']);
+            $runRouteClear = !empty($_POST['run_route_clear']);
+            $runOptimizeClear = !empty($_POST['run_optimize_clear']);
+            $runConfigClear = !empty($_POST['run_config_clear']);
+            $runCacheClear = !empty($_POST['run_cache_clear']);
+            $runViewClear = !empty($_POST['run_view_clear']);
+            $runStorageLink = !empty($_POST['run_storage_link']);
+            $runOptimize = !empty($_POST['run_optimize']);
+
             if (!valid_site($site)) {
+                if ($isAjax) {
+                    http_response_code(400);
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => false, 'error' => "Invalid site name: '$site'. Please ensure a site is currently active in RAM."]);
+                    exit;
+                }
                 flash('err', "Invalid site name: '$site'. Please ensure a site is currently active in RAM.");
                 go($back);
             }
 
             $cmds = [];
+            if ($runRouteClear) $cmds[] = 'route:clear';
+            if ($runConfigClear) $cmds[] = 'config:clear';
+            if ($runCacheClear) $cmds[] = 'cache:clear';
+            if ($runViewClear) $cmds[] = 'view:clear';
+            if ($runOptimizeClear) $cmds[] = 'optimize:clear';
+            if ($runStorageLink) $cmds[] = 'storage:link --force';
+
             if ($runFresh) {
                 $cmds[] = $runSeeds ? 'migrate:fresh --seed --force' : 'migrate:fresh --force';
             } else {
@@ -570,10 +987,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($runSeeds)
                     $cmds[] = 'db:seed --force';
             }
-            if ($cmd !== '' && empty($cmds))
-                $cmds[] = $cmd;
+
+            if ($runOptimize) $cmds[] = 'optimize';
+
+            if ($cmd !== '') {
+                // Strip leading 'php artisan' if user included it
+                $cleanCmd = preg_replace('/^(php\s+)?(artisan\s+)?/i', '', $cmd);
+                if ($cleanCmd !== '' && !in_array($cleanCmd, $cmds, true)) {
+                    $cmds[] = $cleanCmd;
+                }
+            }
 
             if (empty($cmds)) {
+                if ($isAjax) {
+                    http_response_code(400);
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => false, 'error' => 'No artisan command or option selected']);
+                    exit;
+                }
                 flash('err', 'No artisan command or option selected');
                 go($back);
             }
@@ -589,6 +1020,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($rc !== 0)
                     $allOk = false;
             }
+
+            if ($isAjax) {
+                header('Content-Type: application/json');
+                echo json_encode([
+                    'ok' => $allOk,
+                    'site' => $site,
+                    'commands' => $cmds,
+                    'results' => $results,
+                    'output' => implode("\n", $results)
+                ]);
+                exit;
+            }
+
             if ($allOk) {
                 flash('ok', implode(' | ', $results));
             } else {
@@ -808,19 +1252,202 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 flash('err', "Firewall action failed: " . ($err !== '' ? $err : $out));
             }
             go('firewall');
+        case 'service_ctl':
+            $svc = (string) ($_POST['service'] ?? '');
+            $do = (string) ($_POST['do'] ?? 'status');
+            $back = (string) ($_POST['back'] ?? 'services');
+            $isAjax = !empty($_POST['is_ajax']);
+
+            if (!preg_match('/^[a-zA-Z0-9_.@-]{1,80}$/', $svc)) {
+                if ($isAjax) {
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => false, 'error' => 'Invalid service unit name']);
+                    exit;
+                }
+                flash('err', 'Invalid service unit name');
+                go($back);
+            }
+
+            [$rc, $out, $err] = wtc(['--service', $do, $svc]);
+            if ($rc === 0) {
+                if ($isAjax) {
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => true, 'service' => $svc, 'action' => $do, 'msg' => "Service '$svc' $do succeeded"]);
+                    exit;
+                }
+                flash('ok', "Service '$svc' $do succeeded" . ($out ? ": $out" : ''));
+            } else {
+                $errMsg = $err !== '' ? $err : ($out !== '' ? $out : 'Unknown error');
+                if ($isAjax) {
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => false, 'error' => "Action '$do' failed for '$svc': $errMsg"]);
+                    exit;
+                }
+                flash('err', "Service '$svc' $do failed: $errMsg");
+            }
+            go($back);
+        case 'service_patch':
+            $svc = (string) ($_POST['service'] ?? '');
+            $back = (string) ($_POST['back'] ?? 'services');
+            $isAjax = !empty($_POST['is_ajax']);
+
+            if (!preg_match('/^[a-zA-Z0-9_.@-]{1,80}$/', $svc)) {
+                if ($isAjax) {
+                    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => false, 'error' => 'Invalid service unit name']);
+                    if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
+                    exit;
+                }
+                flash('err', 'Invalid service unit name');
+                go($back);
+            }
+
+            [$rc, $out, $err] = wtc(['--service', 'patch', $svc]);
+            $res = json_decode($out, true);
+            if ($rc === 0 && is_array($res) && !empty($res['ok'])) {
+                if ($isAjax) {
+                    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+                    header('Content-Type: application/json');
+                    echo json_encode($res);
+                    if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
+                    exit;
+                }
+                flash('ok', "Service '$svc' patched and restarted successfully.");
+            } else {
+                $errMsg = is_array($res) && !empty($res['error']) ? $res['error'] : ($err !== '' ? $err : ($out !== '' ? $out : 'Patching failed'));
+                if ($isAjax) {
+                    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => false, 'error' => "Failed to patch service '$svc': $errMsg"]);
+                    if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
+                    exit;
+                }
+                flash('err', "Failed to patch service '$svc': $errMsg");
+            }
+            go($back);
+        case 'service_patch_all':
+            $back = (string) ($_POST['back'] ?? 'services');
+            $isAjax = !empty($_POST['is_ajax']);
+
+            [$rc, $out, $err] = wtc(['--service', 'patch-all']);
+            $res = json_decode($out, true);
+            if ($rc === 0 && is_array($res) && !empty($res['ok'])) {
+                if ($isAjax) {
+                    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+                    header('Content-Type: application/json');
+                    echo json_encode($res);
+                    if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
+                    exit;
+                }
+                flash('ok', 'All security updates successfully applied across services.');
+            } else {
+                $errMsg = is_array($res) && !empty($res['error']) ? $res['error'] : ($err !== '' ? $err : ($out !== '' ? $out : 'Failed to apply security patches'));
+                if ($isAjax) {
+                    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => false, 'error' => $errMsg]);
+                    if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
+                    exit;
+                }
+                flash('err', $errMsg);
+            }
+            go($back);
+        case 'security_remediate':
+            $rule = (string) ($_POST['rule'] ?? '');
+            $back = (string) ($_POST['back'] ?? 'services');
+            $isAjax = !empty($_POST['is_ajax']);
+
+            if (!preg_match('/^[a-zA-Z0-9_.-]{1,80}$/', $rule)) {
+                if ($isAjax) {
+                    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => false, 'error' => 'Invalid remediation rule identifier']);
+                    if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
+                    exit;
+                }
+                flash('err', 'Invalid remediation rule identifier');
+                go($back);
+            }
+
+            [$rc, $out, $err] = wtc(['--service', 'remediate', $rule]);
+            $res = json_decode($out, true);
+            if ($rc === 0 && is_array($res) && !empty($res['ok'])) {
+                if ($isAjax) {
+                    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+                    header('Content-Type: application/json');
+                    echo json_encode($res);
+                    if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
+                    exit;
+                }
+                flash('ok', $res['message'] ?? "Security remediation for '$rule' applied.");
+            } else {
+                $errMsg = $err !== '' ? $err : ($out !== '' ? $out : 'Remediation failed');
+                if ($isAjax) {
+                    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => false, 'error' => $errMsg]);
+                    if (function_exists('fastcgi_finish_request')) fastcgi_finish_request();
+                    exit;
+                }
+                flash('err', "Remediation failed: $errMsg");
+            }
+            go($back);
+        case 'cve_lookup':
+            $cve = (string) ($_POST['cve'] ?? $_POST['cve_id'] ?? '');
+            header('Content-Type: application/json');
+            echo json_encode(fetch_cve_details($cve), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+            exit;
+        case 'cve_check':
+            $unit = (string) ($_POST['unit'] ?? '');
+            $ver = (string) ($_POST['version'] ?? 'installed');
+            $cves = audit_service_cves($unit, $ver);
+            header('Content-Type: application/json');
+            echo json_encode(['ok' => true, 'unit' => $unit, 'version' => $ver, 'cves' => $cves], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+            exit;
     }
     go('dashboard');
 }
 
 /* ------------------------------------------------------------ download */
-if (($_GET['download'] ?? '') !== '' && valid_site((string) $_GET['download'])) {
-    $path = SITES_DIR . '/' . $_GET['download'] . '.tar.gz';
+if (($_GET['download'] ?? '') !== '') {
+    $siteToDownload = (string) $_GET['download'];
+    if (!valid_site($siteToDownload)) {
+        flash('err', 'Invalid site name for download');
+        go('sites');
+    }
+
+    $token = (string) ($_GET['csrf'] ?? '');
+    if (!hash_equals(csrf(), $token)) {
+        http_response_code(403);
+        flash('err', 'Security verification failed for download request. Please try again.');
+        go('sites');
+    }
+
+    $path = SITES_DIR . '/' . $siteToDownload . '.tar.gz';
+    // If archive package is missing on disk but site is running in RAM, snapshot state
+    if (!is_file($path)) {
+        [$rc, $out, $err] = wtc(['--save-state', $siteToDownload]);
+    }
+
     if (is_file($path)) {
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        header('Content-Description: File Transfer');
         header('Content-Type: application/gzip');
-        header('Content-Disposition: attachment; filename="' . $_GET['download'] . '.tar.gz"');
+        header('Content-Disposition: attachment; filename="' . $siteToDownload . '.tar.gz"');
+        header('Content-Transfer-Encoding: binary');
+        header('Expires: 0');
+        header('Cache-Control: must-revalidate, post-check=0, pre-check=0, private');
+        header('Pragma: public');
         header('Content-Length: ' . filesize($path));
+        header('X-Content-Type-Options: nosniff');
         readfile($path);
         exit;
+    } else {
+        flash('err', "Package archive for '$siteToDownload' not found.");
+        go('sites');
     }
 }
 
@@ -838,9 +1465,94 @@ if (($_GET['action'] ?? '') === 'db_info') {
     echo wtc(['--db-info', $site])[1] ?? '{}';
     exit;
 }
+if (($_GET['action'] ?? '') === 'dash_live') {
+    header('Content-Type: application/json');
+    $clientId = substr(md5(session_id() ?: ($_SERVER['REMOTE_ADDR'] ?? 'client')), 0, 8);
+    [$rc, $out, $err] = wtc(['--json', 'dash', $clientId]);
+    $data = json_decode($out, true);
+    if (!is_array($data) || empty($data['status'])) {
+        // Fallback for development workstations / demo simulation
+        $cpuCores = [];
+        $totalUsage = 0;
+        for ($i = 0; $i < 4; $i++) {
+            $u = rand(4, 28);
+            $totalUsage += $u;
+            $cpuCores[] = ['id' => $i, 'usage' => $u];
+        }
+        $data = [
+            'demo' => true,
+            'status' => [
+                'host' => gethostname() ?: 'wtc-pi',
+                'model' => 'Raspberry Pi 4 Model B (Emulated)',
+                'temp' => (42 + rand(0, 80) / 10) . '°C',
+                'uptime' => '4 days, 2 hrs',
+                'ips' => ($_SERVER['SERVER_ADDR'] ?? '192.168.1.150'),
+                'active' => 'site-alpha',
+                'activeSites' => [
+                    ['name' => 'site-alpha', 'slug' => 'site-alpha', 'url' => '/site-alpha/']
+                ],
+                'nginx' => 'yes',
+                'phpfpm' => 'yes',
+                'mariadb' => 'yes',
+                'samba' => 'yes',
+                'ssh' => 'yes',
+                'ramUsed' => 145000000 + rand(0, 5000000),
+                'ramSize' => 536870912,
+                'sysMemUsed' => 840000000 + rand(0, 10000000),
+                'sysMemTotal' => 4050000000,
+                'diskUsed' => 4500000000,
+                'diskSize' => 31200000000,
+                'pending' => 0,
+                'rejected' => 0,
+                'sites' => 3,
+                'workers' => [
+                    'service' => 'yes',
+                    'has_artisan' => true,
+                    'queue' => ['running' => true, 'pid' => '1024'],
+                    'schedule' => ['running' => true, 'pid' => '1025']
+                ]
+            ],
+            'cpu' => [
+                'freq_mhz' => 1500,
+                'total' => round($totalUsage / 4, 1),
+                'cores' => $cpuCores,
+                'count' => 4
+            ],
+            'build' => ['busy' => false, 'log' => ''],
+            'loadavg' => ['0.14', '0.22', '0.19'],
+            'throttling' => [
+                'code' => '0x0',
+                'under_voltage' => false,
+                'throttled' => false,
+                'freq_capped' => false,
+                'temp_limit' => false,
+                'under_voltage_occurred' => false
+            ],
+            'saved_state' => [
+                'last_saved' => time() - 340,
+                'is_dirty' => false
+            ],
+            'net_rates' => [
+                'rx_bytes_sec' => rand(15000, 65000),
+                'tx_bytes_sec' => rand(8000, 32000)
+            ]
+        ];
+    } else {
+        if (empty($data['cpu']) || !isset($data['cpu']['total'])) {
+            [$sRc, $sOut] = wtc(['--json', 'sysinfo', $clientId]);
+            $sData = json_decode($sOut, true);
+            if (is_array($sData) && isset($sData['total'])) {
+                $data['cpu'] = $sData;
+            }
+        }
+    }
+    echo json_encode($data);
+    exit;
+}
 if (($_GET['action'] ?? '') === 'sysinfo') {
     header('Content-Type: application/json');
-    [$rc, $out, $err] = wtc(['--json', 'sysinfo']);
+    $clientId = substr(md5(session_id() ?: ($_SERVER['REMOTE_ADDR'] ?? 'client')), 0, 8);
+    [$rc, $out, $err] = wtc(['--json', 'sysinfo', $clientId]);
     $data = json_decode($out, true);
     if (!is_array($data) || empty($data['cores'])) {
         // Fallback for dev workstations / environments without /proc/stat
@@ -866,15 +1578,8 @@ if (($_GET['action'] ?? '') === 'processes') {
     header('Content-Type: application/json');
     [$rc, $out, $err] = wtc(['--json', 'processes']);
     $data = json_decode($out, true);
-    if (!is_array($data) || empty($data)) {
-        // Fallback for dev workstations
-        $data = [
-            ['pid' => 540, 'user' => 'root', 'cpu' => 1.2, 'mem' => 0.4, 'stat' => 'Ss', 'comm' => 'nginx', 'cmd' => 'nginx: master process /usr/sbin/nginx'],
-            ['pid' => 542, 'user' => 'www-data', 'cpu' => 3.5, 'mem' => 1.8, 'stat' => 'S', 'comm' => 'php-fpm', 'cmd' => 'php-fpm: pool www'],
-            ['pid' => 610, 'user' => 'mysql', 'cpu' => 0.8, 'mem' => 4.2, 'stat' => 'Sl', 'comm' => 'mariadbd', 'cmd' => '/usr/sbin/mariadbd'],
-            ['pid' => 840, 'user' => 'root', 'cpu' => 0.1, 'mem' => 0.2, 'stat' => 'Ss', 'comm' => 'smbd', 'cmd' => '/usr/sbin/smbd -F --no-process-group'],
-            ['pid' => 912, 'user' => 'wtc-ui', 'cpu' => 0.4, 'mem' => 0.9, 'stat' => 'S', 'comm' => 'php', 'cmd' => 'php /usr/local/bin/wtc-workers']
-        ];
+    if (!is_array($data)) {
+        $data = [];
     }
     echo json_encode($data);
     exit;
@@ -889,38 +1594,124 @@ if (($_GET['action'] ?? '') === 'net_monitor') {
     [$rc, $out, $err] = wtc(['--json', 'net_monitor', (string) $limit]);
     $data = json_decode($out, true);
     if (!is_array($data) || empty($data['listeners'])) {
-        // Fallback for development workstations
-        $clientIp = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
-        $mockReqs = [
-            ['ip' => $clientIp, 'time' => date('d/M/Y:H:i:s O'), 'method' => 'GET', 'path' => '/?p=dashboard', 'status' => '200', 'ua' => $_SERVER['HTTP_USER_AGENT'] ?? 'Browser'],
-            ['ip' => '192.168.1.115', 'time' => date('d/M/Y:H:i:s O', time() - 25), 'method' => 'GET', 'path' => '/site/', 'status' => '200', 'ua' => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15'],
-            ['ip' => '192.168.1.115', 'time' => date('d/M/Y:H:i:s O', time() - 22), 'method' => 'GET', 'path' => '/site/api/users', 'status' => '200', 'ua' => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15'],
-            ['ip' => '192.168.1.102', 'time' => date('d/M/Y:H:i:s O', time() - 60), 'method' => 'POST', 'path' => '/site/login', 'status' => '302', 'ua' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'],
-            ['ip' => $clientIp, 'time' => date('d/M/Y:H:i:s O', time() - 90), 'method' => 'GET', 'path' => '/?action=sysinfo', 'status' => '200', 'ua' => $_SERVER['HTTP_USER_AGENT'] ?? 'Browser'],
-            ['ip' => '192.168.1.115', 'time' => date('d/M/Y:H:i:s O', time() - 110), 'method' => 'GET', 'path' => '/site/css/app.css', 'status' => '200', 'ua' => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)']
-        ];
         $data = [
-            'host' => gethostname() ?: 'pi',
-            'gateway' => '192.168.1.1',
-            'client_ip' => $clientIp,
-            'ifaces' => [
-                ['iface' => 'eth0', 'ip' => '192.168.1.50'],
-                ['iface' => 'wlan0', 'ip' => '192.168.1.150']
-            ],
-            'listeners' => [
-                ['port' => 80, 'proc' => 'nginx'],
-                ['port' => 8080, 'proc' => 'nginx'],
-                ['port' => 4485, 'proc' => 'nginx'],
-                ['port' => 3306, 'proc' => 'mariadbd'],
-                ['port' => 22, 'proc' => 'sshd'],
-                ['port' => 445, 'proc' => 'smbd']
-            ],
-            'requests' => array_slice($mockReqs, 0, $limit)
+            'host' => gethostname() ?: '',
+            'gateway' => '',
+            'client_ip' => $_SERVER['REMOTE_ADDR'] ?? '',
+            'ifaces' => [],
+            'listeners' => [],
+            'requests' => []
         ];
     } else {
         $data['client_ip'] = $_SERVER['REMOTE_ADDR'] ?? 'Unknown';
     }
     echo json_encode($data);
+    exit;
+}
+if (($_GET['action'] ?? '') === 'service_logs') {
+    $svc = (string) ($_GET['service'] ?? '');
+    $lines = (int) ($_GET['lines'] ?? 50);
+    if ($lines < 10) $lines = 10;
+    if ($lines > 500) $lines = 500;
+    header('Content-Type: application/json');
+    if (!preg_match('/^[a-zA-Z0-9_.@-]{1,80}$/', $svc)) {
+        echo json_encode(['ok' => false, 'error' => 'Invalid service name']);
+        exit;
+    }
+    [$rc, $out, $err] = wtc(['--service', 'logs', $svc, (string) $lines]);
+    $logs = trim($out !== '' ? $out : $err);
+    if ($logs === '' || $rc !== 0) {
+        $logs = "No systemd journal entries available for $svc.";
+    }
+    echo json_encode(['ok' => true, 'service' => $svc, 'logs' => $logs]);
+    exit;
+}
+if (($_GET['action'] ?? '') === 'services_json') {
+    header('Content-Type: application/json');
+    $data = wj('services', true);
+    echo json_encode($data);
+    exit;
+}
+if (($_GET['action'] ?? '') === 'service_security_scan') {
+    header('Content-Type: application/json');
+    $force = !empty($_GET['force']) ? '1' : '0';
+    if ($force === '1') {
+        @set_time_limit(180);
+        get_cve_threat_catalog(true); // Update live OSV catalog on disk FIRST
+    }
+    [$rc, $out, $err] = wtc(['--security-scan', $force]);
+    $data = json_decode($out, true);
+    if (!is_array($data) || empty($data)) {
+        echo json_encode(['ok' => false, 'error' => 'Live security scan unavailable: ' . ($err !== '' ? $err : 'backend returned no data')]);
+        exit;
+    }
+    echo json_encode(['ok' => true, 'report' => $data], JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+    exit;
+}
+if (($_GET['action'] ?? '') === 'cve_lookup') {
+    header('Content-Type: application/json');
+    $cve = (string) ($_GET['cve'] ?? $_GET['cve_id'] ?? '');
+    echo json_encode(fetch_cve_details($cve), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+if (($_GET['action'] ?? '') === 'cve_check') {
+    header('Content-Type: application/json');
+    $unit = (string) ($_GET['unit'] ?? '');
+    $ver = (string) ($_GET['version'] ?? '');
+    $force = !empty($_GET['force']);
+
+    $detectedVer = resolve_service_version($unit);
+    if ($detectedVer !== '') {
+        $ver = $detectedVer;
+    } elseif ($ver === 'installed') {
+        $ver = '';
+    }
+
+    $cves = audit_service_cves($unit, $ver, [], $force);
+    $pending = array_values(array_filter($cves, fn($c) => ($c['status'] ?? '') === 'pending' || !empty($c['is_affected'])));
+
+    $badgeText = '🛡️ Hardened';
+    $badgeType = 'clean';
+    $primaryCve = null;
+
+    if (!empty($pending)) {
+        $primaryCve = $pending[0];
+        foreach ($pending as $c) {
+            if (!empty($c['is_downgraded'])) {
+                $primaryCve = $c;
+                break;
+            }
+            if (($c['cvss'] ?? 0) > ($primaryCve['cvss'] ?? 0)) {
+                $primaryCve = $c;
+            }
+        }
+        $moreCount = count($pending) - 1;
+        if (!empty($primaryCve['is_downgraded'])) {
+            $badgeText = '⚠️ Downgraded' . ($moreCount > 0 ? " (+$moreCount)" : '');
+            $badgeType = 'downgraded';
+        } else {
+            $badgeText = '⚠️ ' . ($primaryCve['id'] ?? 'Vulnerable') . ($moreCount > 0 ? " (+$moreCount)" : '');
+            $badgeType = 'vulnerable';
+        }
+    } elseif (!empty($cves)) {
+        $badgeText = '🛡️ Patched';
+        $badgeType = 'patched';
+    }
+
+    echo json_encode([
+        'ok' => true,
+        'unit' => $unit,
+        'version' => $ver,
+        'has_vulnerabilities' => !empty($pending),
+        'vulnerabilities_count' => count($pending),
+        'badge_text' => $badgeText,
+        'badge_type' => $badgeType,
+        'primary_cve' => $primaryCve,
+        'pending_cves' => $pending,
+        'cves' => $cves,
+        'scanned_at' => date('H:i:s'),
+        'scanned_timestamp' => date('Y-m-d H:i:s')
+    ], JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR);
     exit;
 }
 
@@ -929,6 +1720,7 @@ $page = (string) ($_GET['p'] ?? 'dashboard');
 $pages = [
     'dashboard' => '🖥️ Device Dashboard',
     'sites' => '📁 Sites & Apps',
+    'services' => '⚙️ Service Manager',
     'database' => '🗄️ Database',
     'explorer' => '⚡ RAM Drive',
     'nginx' => '🌐 Nginx Config',
@@ -1169,6 +1961,111 @@ main, .main-container {
 .telemetry { display: flex; gap: 18px; flex-wrap: wrap; font-size: 0.82rem; color: #8b949e; }
 .telemetry span b { color: #e6edf3; font-weight: 600; }
 .quick-device-controls { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+
+/* Dashboard KPI Tiles Grid & Cards */
+.dash-kpis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 14px;
+    width: 100%;
+}
+.kpi-card {
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    min-height: 104px;
+    box-sizing: border-box;
+}
+.kpi-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+}
+.kpi-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+.kpi-badge {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+}
+.kpi-badge.ok { background: #13241b; color: #3fb950; border: 1px solid #238636; }
+.kpi-badge.warn { background: #271f11; color: #d29922; border: 1px solid #9e6a03; }
+.kpi-badge.danger { background: #2c1517; color: #f85149; border: 1px solid #da3633; }
+.kpi-value-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+}
+.kpi-val {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: #f0f6fc;
+}
+.kpi-sub {
+    font-size: 0.76rem;
+    color: #8b949e;
+}
+.kpi-spark-wrap {
+    height: 32px;
+    width: 100%;
+    margin-top: 6px;
+}
+.kpi-spark {
+    width: 100%;
+    height: 32px;
+    display: block;
+}
+.kpi-foot {
+    font-size: 0.72rem;
+    color: #8b949e;
+    margin-top: 6px;
+}
+
+/* Alert Strip Items */
+.dash-alert-item {
+    padding: 10px 14px;
+    border-radius: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    font-size: 0.84rem;
+}
+.dash-alert-item.warn {
+    background: #1c150b;
+    border: 1px solid #9e6a03;
+    color: #e3b341;
+}
+.dash-alert-item.danger {
+    background: #230f12;
+    border: 1px solid #da3633;
+    color: #f85149;
+}
+
+/* Accordion Deep Inspectors */
+.dash-accordion summary {
+    outline: none;
+    transition: color 0.15s ease;
+}
+.dash-accordion summary::-webkit-details-marker {
+    display: none;
+}
+.dash-accordion summary:hover {
+    color: #58a6ff;
+}
 
 /* Enterprise Grids */
 .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-bottom: 14px; width: 100%; }
@@ -1713,6 +2610,52 @@ input:focus, select:focus, textarea:focus {
     .quick-device-controls {
         grid-template-columns: 1fr;
     }
+}
+
+/* Site table row drag & drop auto-update styles */
+tr.site-row {
+    transition: background 0.15s ease, outline 0.15s ease;
+}
+tr.site-row.dragover {
+    background: #11261d !important;
+    outline: 2px dashed #2ea043 !important;
+    outline-offset: -2px;
+}
+tr.site-row.dragover td {
+    color: #7ee787 !important;
+}
+.row-drop-badge {
+    display: inline-block;
+    background: #238636;
+    color: #fff;
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-left: 6px;
+    animation: rowPulse 1s infinite alternate;
+}
+@keyframes rowPulse { from { opacity: 0.7; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+
+.btn-reupload {
+    background: #13233a;
+    border: 1px solid #1f6feb;
+    color: #79c0ff;
+    font-size: 0.82rem;
+    font-weight: 600;
+    padding: 5px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    text-decoration: none;
+    transition: all .15s ease;
+}
+.btn-reupload:hover {
+    background: #1f6feb;
+    color: #ffffff;
+    border-color: #58a6ff;
 }
 
 footer { text-align: center; color: #484f58; font-size: 0.78rem; padding: 16px 20px; border-top: 1px solid #21262d; margin-top: auto; }
