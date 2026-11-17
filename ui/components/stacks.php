@@ -535,15 +535,34 @@ if ($prefix !== '' && str_starts_with($reqUri, $prefix)) {
 }
 $reqUri = '/' . ltrim((string)$reqUri, '/');
 
-$filePath = __DIR__ . $reqUri;
-if (!is_file($filePath) && is_file(__DIR__ . '/public' . $reqUri)) {
-    $filePath = __DIR__ . '/public' . $reqUri;
+// Security Defense: Canonicalize path and prevent directory traversal (CWE-22)
+$root = realpath(__DIR__) ?: __DIR__;
+$publicRoot = realpath(__DIR__ . '/public') ?: ($root . '/public');
+
+$candidate = $root . $reqUri;
+$resolvedPath = realpath($candidate);
+
+if (($resolvedPath === false || !is_file($resolvedPath)) && is_dir($publicRoot)) {
+    $candidate = $publicRoot . $reqUri;
+    $resolvedPath = realpath($candidate);
 }
 
-$ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest'], true);
+// Disallow traversal outside site root or public folder
+$isValidPath = false;
+if ($resolvedPath !== false && is_file($resolvedPath)) {
+    if (str_starts_with($resolvedPath, $root) || (is_dir($publicRoot) && str_starts_with($resolvedPath, $publicRoot))) {
+        // Reject hidden files, environment files, git, sqlite, and config files
+        $base = basename($resolvedPath);
+        if (!str_starts_with($base, '.') && !preg_match('/\.(env|git|htaccess|htpasswd|conf|ini|log|sqlite|sqlite3|db|sh|bak)$/i', $base)) {
+            $isValidPath = true;
+        }
+    }
+}
 
-if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) {
+$ext = $isValidPath ? strtolower(pathinfo($resolvedPath, PATHINFO_EXTENSION)) : '';
+$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest', 'txt', 'xml'], true);
+
+if ($isValidPath && $reqUri !== '/' && $isAsset && !str_ends_with($resolvedPath, '.php')) {
     $mimes = [
         'js' => 'application/javascript', 'mjs' => 'application/javascript',
         'css' => 'text/css', 'html' => 'text/html', 'htm' => 'text/html',
@@ -552,11 +571,12 @@ if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) 
         'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp',
         'ico' => 'image/x-icon', 'woff' => 'font/woff', 'woff2' => 'font/woff2',
         'ttf' => 'font/ttf', 'eot' => 'application/vnd.ms-fontobject',
-        'wasm' => 'application/wasm'
+        'wasm' => 'application/wasm', 'webmanifest' => 'application/manifest+json',
+        'txt' => 'text/plain', 'xml' => 'application/xml'
     ];
     $mime = $mimes[$ext] ?? 'application/octet-stream';
     header('Content-Type: ' . $mime);
-    readfile($filePath);
+    readfile($resolvedPath);
     exit;
 }
 

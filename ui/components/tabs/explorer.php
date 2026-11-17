@@ -208,13 +208,23 @@ if (!function_exists('getFileIcon')) {
                 Inspect physical in-memory storage at <code>/mnt/ramdisk</code>. Zero flash wear, ultra-low latency.
             </div>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
             <a class="btn-ctrl" href="/?p=explorer&path=" style="text-decoration:none;font-size:0.8rem">Root</a>
             <a class="btn-ctrl" href="/?p=explorer&path=sites" style="text-decoration:none;font-size:0.8rem">📁 /sites</a>
             <a class="btn-ctrl" href="/?p=explorer&path=webroot" style="text-decoration:none;font-size:0.8rem">🔗 /webroot</a>
             <a class="btn-ctrl" href="/?p=explorer&preview=nginx.conf" style="text-decoration:none;font-size:0.8rem;border-color:#388bfd;color:#79c0ff">⚙️ nginx.conf</a>
             <a class="btn-ctrl" href="/?p=explorer&path=nginx-sites" style="text-decoration:none;font-size:0.8rem">🌐 /nginx-sites</a>
             <a class="btn-ctrl" href="/?p=explorer&path=php-tmp" style="text-decoration:none;font-size:0.8rem">⚡ /php-tmp</a>
+            <?php
+            $explorerSiteContext = '';
+            if (preg_match('#^sites/([^/]+)#', $cleanRelPath, $mSite)) {
+                $explorerSiteContext = $mSite[1];
+            }
+            ?>
+            <button type="button" class="btn-pri"
+                style="font-size:0.8rem;padding:5px 12px;background:#1f6feb;border-color:#388bfd;font-weight:600"
+                onclick="if (window.WtcLogViewer) { window.WtcLogViewer.openModal({ path: <?= h(json_encode($cleanRelPath)) ?>, site: <?= h(json_encode($explorerSiteContext)) ?> }); } else { location.href='/?p=logs'; }"
+                title="Open formatted Stack & RAM Drive Logs Viewer">📜 View Logs</button>
         </div>
     </div>
 </div>
@@ -347,17 +357,37 @@ if (!function_exists('getFileIcon')) {
 <?php endif; ?>
 
 <?php if ($previewFile !== ''): ?>
+    <?php $isLogPreview = $previewName !== null && preg_match('/\.(log|error)$/i', $previewName); ?>
     <div class="card" style="margin-bottom:16px;border-color:#388bfd">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
             <h4 style="margin:0;color:#79c0ff;display:flex;align-items:center;gap:8px">
-                📄 Preview: <code><?= h($previewName) ?></code>
+                <?= $isLogPreview ? '📜' : '📄' ?> Preview: <code><?= h($previewName) ?></code>
             </h4>
-            <a class="btn-ctrl" href="/?p=explorer&path=<?= urlencode($cleanRelPath) ?>" style="text-decoration:none;padding:4px 8px;font-size:0.8rem">✖ Close Preview</a>
+            <div style="display:flex;gap:8px;align-items:center">
+                <?php if ($isLogPreview && !$previewError): ?>
+                    <button type="button" class="btn-ctrl" style="font-size:0.78rem;padding:4px 10px;border-color:#388bfd;color:#79c0ff"
+                        onclick="if (window.WtcLogViewer) { window.WtcLogViewer.openModal({ source: <?= h(json_encode('ram:' . ltrim(str_replace(['\\', '..'], ['/', ''], $previewFile), '/'))) ?> }); }">
+                        🔍 Open in Stack Logs Viewer
+                    </button>
+                <?php endif; ?>
+                <a class="btn-ctrl" href="/?p=explorer&path=<?= urlencode($cleanRelPath) ?>" style="text-decoration:none;padding:4px 8px;font-size:0.8rem">✖ Close Preview</a>
+            </div>
         </div>
         <?php if ($previewError): ?>
             <div style="background:#2c1517;color:#f85149;padding:12px;border-radius:6px;font-size:0.85rem">
                 ⚠️ <?= h($previewError) ?>
             </div>
+        <?php elseif ($isLogPreview): ?>
+            <div id="explorerLogPreviewContainer"></div>
+            <script>
+            (() => {
+                const el = document.getElementById('explorerLogPreviewContainer');
+                const raw = <?= json_encode((string)$previewContent, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP | JSON_INVALID_UTF8_SUBSTITUTE) ?>;
+                if (el && window.WtcLogViewer) {
+                    window.WtcLogViewer.formatInline(el, raw, { maxHeight: '420px', newestFirst: true });
+                }
+            })();
+            </script>
         <?php else: ?>
             <pre style="background:#050a10;color:#c9d1d9;padding:12px;border-radius:6px;max-height:400px;overflow-y:auto;font-size:0.82rem;font-family:monospace;white-space:pre-wrap;line-height:1.4"><?= h($previewContent) ?></pre>
         <?php endif; ?>
@@ -417,8 +447,14 @@ if (!function_exists('getFileIcon')) {
                     <td style="color:#8b949e;font-size:0.82rem">
                         <?= $item['mtime'] ? date('Y-m-d H:i:s', $item['mtime']) : '-' ?>
                     </td>
-                    <td style="text-align:center">
+                    <td style="text-align:center;white-space:nowrap">
                         <?php if (!$item['isDir']): ?>
+                            <?php if (preg_match('/\.(log|error)$/i', $item['name'])): ?>
+                                <button type="button" class="btn-ctrl" style="padding:3px 8px;font-size:0.75rem;border-color:#388bfd;color:#79c0ff;margin-right:4px"
+                                    onclick="if (window.WtcLogViewer) { window.WtcLogViewer.openModal({ source: <?= h(json_encode('ram:' . $item['relPath'])) ?> }); }">
+                                    📜 View Logs
+                                </button>
+                            <?php endif; ?>
                             <a href="/?p=explorer&path=<?= urlencode($cleanRelPath) ?>&preview=<?= urlencode($item['relPath']) ?>" class="btn-ctrl" style="text-decoration:none;padding:3px 8px;font-size:0.75rem">
                                 👁️ View
                             </a>

@@ -8,6 +8,8 @@ declare(strict_types=1);
 $sites = wj('sites');
 $buildJob = wj('build');
 $st = wj('status');
+$set = wj('settings');
+$forceHttps = ($set['FORCE_HTTPS'] ?? 'no') === 'yes';
 ?>
 
 <!-- Drag & Drop Instant Deployer -->
@@ -30,8 +32,23 @@ $st = wj('status');
     <div
         style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;border-bottom:1px solid #1c2128;padding-bottom:8px">
         <h3 style="margin:0;border:0;padding:0">Available Applications &amp; Archives</h3>
-        <div style="display:flex;align-items:center;gap:10px">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
             <small style="color:#8b949e">💡 <b>Drop &amp; Auto-Update:</b> Drag and drop folders or archives directly onto any row below to update that application instantly.</small>
+            <?php
+            $totalRollbacks = 0;
+            $totalRollbackBytes = 0;
+            foreach ($sites as $_s) {
+                $totalRollbacks += (int)($_s['rollbackCount'] ?? (!empty($_s['hasPrevious']) ? 1 : 0));
+                $totalRollbackBytes += (int)($_s['rollbackSize'] ?? 0);
+            }
+            ?>
+            <?php if ($totalRollbacks > 0): ?>
+                <?= form('rollback_clear', ['site' => '__ALL__', 'back' => 'sites'], '🧹 Clear All Rollbacks (' . $totalRollbacks . ' · ' . fmt_bytes($totalRollbackBytes) . ')', 'btn-ctrl', 'Delete ALL saved rollback snapshots across every site? This frees ' . fmt_bytes($totalRollbackBytes) . ' and cannot be undone.') ?>
+            <?php endif; ?>
+            <?= form('setting', ['key' => 'FORCE_HTTPS', 'value' => $forceHttps ? 'no' : 'yes', 'back' => 'sites'], $forceHttps ? '🔒 HTTPS Forced (Click to Disable)' : '🔓 Force HTTPS: Off', $forceHttps ? 'btn' : 'btn-ctrl', $forceHttps ? 'Disable Force HTTPS and allow plain HTTP on live sites?' : 'Force HTTPS on all live sites (redirects Port 80/8080 to Port 443)?') ?>
+            <button type="button" class="btn" style="border-color:#388bfd;color:#79c0ff"
+                onclick="if (window.WtcLogViewer) { window.WtcLogViewer.openModal({}); }"
+                title="View formatted Stack &amp; Runtime Logs">📜 View Logs</button>
             <form method="post" style="display:inline">
                 <?= csrf_field() ?>
                 <input type="hidden" name="action" value="rescan_sites">
@@ -79,14 +96,27 @@ $st = wj('status');
                                 <span class="pill" style="background:#1f6feb;color:#fff;font-size:0.72rem"
                                     title="Primary site serving Port 80 and Port 8080">⭐ Primary</span>
                             <?php endif; ?>
+                            <?php if (($s['stack'] ?? '') === 'laravel' || !empty($s['storageLinked'])): ?>
+                                <?php if (!empty($s['storageLinked'])): ?>
+                                    <span class="pill ok" style="font-size:0.72rem" title="public/storage is linked to storage/app/public">🔗 storage linked</span>
+                                <?php else: ?>
+                                    <span class="pill err" style="background:#441c1c;color:#ff7b72;font-size:0.72rem" title="public/storage is missing or not linked to storage/app/public">⚠️ storage unlinked</span>
+                                <?php endif; ?>
+                            <?php endif; ?>
                         <?php endif; ?>
                         <?php if ($isActive && $isPrimary && !empty($st['workers']['queue']['running'])): ?>
                             <span class="pill" style="background:#13233a;color:#79c0ff;border:1px solid #1f6feb">⚙️ workers
                                 active</span>
                         <?php endif; ?>
+                        <?php if (!empty($s['catalogRebuilding'])): ?>
+                            <span class="pill" style="background:#1c2533;color:#79c0ff;border:1px solid #388bfd;font-size:0.72rem" title="Rebuilding SD card catalog archive in background">💾 syncing catalog...</span>
+                        <?php endif; ?>
                     </div>
-                    <div style="font-size:0.75rem;color:#8b949e;margin-top:3px">
-                        URL: <code><?= h(site_url($isPrimary ? '/' : $url)) ?></code>
+                    <div style="font-size:0.75rem;color:#8b949e;margin-top:3px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                        <span>URL: <code><?= h(site_url($isPrimary ? '/' : $url)) ?></code></span>
+                        <?php if (!empty($s['port'])): ?>
+                            <a href="<?= h(site_port_url((int)$s['port'], '/')) ?>" target="_blank" class="pill ok" style="text-decoration:none;font-size:0.68rem" title="Dedicated Port listener">🌐 :<?= (int)$s['port'] ?></a>
+                        <?php endif; ?>
                     </div>
                 </td>
                 <td><?= fmt_bytes($s['size']) ?></td>
@@ -95,18 +125,29 @@ $st = wj('status');
                     <?php if ($isActive): ?>
                         <?php
                         $targetUrl = site_url($isPrimary ? '/' : $url);
-                        $targetLabel = $isPrimary ? 'Port 80 (/)' : $url;
+                        $targetLabel = $isPrimary ? ($forceHttps ? 'HTTPS (/)' : 'Port 80 (/)') : $url;
                         ?>
                         <a class="btn-pri" href="<?= h($targetUrl) ?>" target="_blank"
-                            style="background:#238636;border:0;padding:5px 10px;border-radius:6px;font-weight:600;text-decoration:none;display:inline-block;font-size:0.82rem">🚀
+                            style="background:#238636;border:0;padding:5px 10px;border-radius:6px;font-weight:600;text-decoration:none;display:inline-block;font-size:0.82rem"><?= $forceHttps ? '🔒' : '🚀' ?>
                             <?= h($targetLabel) ?></a>
                         <?php if ($isPrimary): ?>
+                            <?php if (!$forceHttps): ?>
                             <a class="btn-pri" href="<?= site_port_url(8080, '/') ?>"
                                 target="_blank"
                                 style="background:#1f6feb;border:0;padding:5px 10px;border-radius:6px;font-weight:600;text-decoration:none;display:inline-block;font-size:0.82rem"
                                 title="Open at Root / on Port 8080">:8080</a>
+                            <?php endif; ?>
                         <?php else: ?>
                             <?= form('set_primary', ['site' => $s['name'], 'back' => 'sites'], '⭐ Make Primary', '', '', 'btn', 'Set as primary site for Port 80 and Port 8080') ?>
+                        <?php endif; ?>
+                        <?php if (!empty($s['port'])): ?>
+                            <a class="btn-pri" href="<?= site_port_url((int)$s['port'], '/') ?>"
+                                target="_blank"
+                                style="background:#1f6feb;border:0;padding:5px 10px;border-radius:6px;font-weight:600;text-decoration:none;display:inline-block;font-size:0.82rem"
+                                title="Open on Dedicated Port <?= (int)$s['port'] ?>">:<?= (int)$s['port'] ?></a>
+                        <?php endif; ?>
+                        <?php if (($s['stack'] ?? '') === 'laravel' && empty($s['storageLinked'])): ?>
+                            <?= form('storage_link', ['site' => $s['name'], 'back' => 'sites'], '🔗 Link Storage', 'btn', 'Ensure public/storage is linked to storage/app/public for ' . $s['name'] . '?') ?>
                         <?php endif; ?>
                         <?= form('deactivate', ['site' => $s['name'], 'back' => 'sites'], '⏹️ Stop', 'danger', 'Stop and unload ' . $s['name'] . ' from RAM?') ?>
                     <?php else: ?>
@@ -115,9 +156,24 @@ $st = wj('status');
                     <?php if (!empty($s['hasBuild'])): ?>
                         <?= form('build', ['site' => $s['name'], 'back' => 'sites'], '🔨 Build', '') ?>
                     <?php endif; ?>
-                    <?php if ($s['hasPrevious']): ?>
-                        <?= form('rollback', ['site' => $s['name'], 'back' => 'sites'], 'Rollback', '', 'Restore previous version?') ?>
+                    <?php
+                    $rbList = is_array($s['rollbacks'] ?? null) ? $s['rollbacks'] : [];
+                    $rbCount = (int)($s['rollbackCount'] ?? count($rbList));
+                    if ($rbCount === 0 && !empty($s['hasPrevious'])) {
+                        $rbCount = 1;
+                    }
+                    ?>
+                    <?php if ($rbCount > 0): ?>
+                        <button type="button" class="btn" style="border-color:#d29922;color:#e3b341"
+                            onclick='openRollbackModal(<?= h(json_encode($s["name"])) ?>, <?= h(json_encode($rbList)) ?>)'
+                            title="Choose a rollback version or clear saved rollbacks">⏪ Rollback (<?= $rbCount ?>)</button>
                     <?php endif; ?>
+
+                    <!-- Duplicate system instance button -->
+                    <button type="button" class="btn" style="border-color:#388bfd;color:#79c0ff" onclick="openDuplicateModal('<?= h($s['name']) ?>', '<?= h($s['stack'] ?? '') ?>', <?= !empty($s['port']) ? (int)$s['port'] : 'null' ?>, <?= $isActive ? 'true' : 'false' ?>)" title="Duplicate <?= h($s['name']) ?> to run multiple versions or on a separate port">📋 Duplicate</button>
+
+                    <!-- View Stack Logs button -->
+                    <button type="button" class="btn" style="border-color:#30363d;color:#79c0ff" onclick="if (window.WtcLogViewer) { window.WtcLogViewer.openModal({ site: <?= h(json_encode($s['name'])) ?>, title: <?= h(json_encode('📜 Stack Logs — ' . $s['name'])) ?> }); }" title="View formatted logs for <?= h($s['name']) ?>">📜 View Logs</button>
 
                     <!-- Re-upload project button -->
                     <button type="button" class="btn btn-reupload" onclick="openReuploadModal('<?= h($s['name']) ?>', <?= $isActive ? 'true' : 'false' ?>, '<?= h($s['stack'] ?? '') ?>', <?= $isPrimary ? 'true' : 'false' ?>)" title="Re-upload archive or folder to update <?= h($s['name']) ?>">🔄 Re-upload</button>
@@ -153,6 +209,7 @@ $st = wj('status');
         <div class="modal-body">
             <p style="font-size:0.86rem;color:#8b949e;margin-bottom:14px">
                 Upload an updated package (<code>.zip</code>, <code>.tar.gz</code>) or folder to update <b id="reuploadSiteNameLabel" style="color:#79c0ff">app</b>.
+                Files are replaced <b>directly in RAM</b> for instant access, then the SD card catalog is rebuilt in the background.
                 Database credentials, <code>.env</code> configurations, database snapshots, and user storage are <b>automatically protected and preserved</b>.
             </p>
 
@@ -163,9 +220,13 @@ $st = wj('status');
                 <div style="font-size:0.8rem;color:#8b949e;margin-top:4px">or click to browse from your computer</div>
             </div>
 
-            <div style="display:flex;gap:10px;justify-content:center;margin-bottom:14px">
+            <div style="display:flex;gap:10px;justify-content:center;margin-bottom:10px">
                 <button type="button" class="btn" onclick="document.getElementById('reuploadArchiveInput').click()">📦 Browse Archive (.zip / .tar.gz)</button>
-                <button type="button" class="btn" onclick="document.getElementById('reuploadFolderInput').click()">📁 Browse Folder</button>
+                <button type="button" class="btn" onclick="browseReuploadFolder()">📁 Browse Folder</button>
+            </div>
+            <div id="reuploadHttpsHint" style="display:none;text-align:center;margin-bottom:14px;font-size:0.76rem;color:#8b949e">
+                💡 <a id="reuploadHttpsLink" href="#" class="no-spa" style="color:#79c0ff;text-decoration:underline">Use HTTPS (port 4486)</a> for fast folder browsing
+                <a href="/?download_ui_cert=1" download="pilabwtc-ui.crt" class="btn no-spa" style="margin-left:6px;padding:2px 8px;font-size:0.72rem">🔐 Download HTTPS Cert (.crt)</a>
             </div>
 
             <input type="file" id="reuploadArchiveInput" accept=".zip,.tar,.gz,.tgz,.tar.gz" style="display:none">
@@ -177,6 +238,14 @@ $st = wj('status');
                     <input type="checkbox" id="reuploadSpinUp" checked>
                     <span>⚡ <b>Update and reload live in RAM immediately</b></span>
                 </label>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:0.85rem;color:#c9d1d9">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                        <input type="checkbox" id="reuploadRecentOnly" checked onchange="saveReuploadRecentPrefs()">
+                        <span>⏱️ <b>Only upload files saved in the past</b></span>
+                    </label>
+                    <input type="number" id="reuploadRecentMins" value="3" min="1" max="10080" oninput="saveReuploadRecentPrefs()" style="width:64px;background:#0d1117;color:#79c0ff;border:1px solid #30363d;border-radius:4px;padding:2px 6px;font-size:0.82rem;text-align:center;font-weight:600">
+                    <span style="color:#8b949e;font-size:0.82rem">minutes <span style="font-size:0.75rem">(folder uploads)</span></span>
+                </div>
             </div>
 
             <!-- Protected Files Selection Section -->
@@ -244,8 +313,159 @@ $st = wj('status');
     </div>
 </div>
 
+<!-- Duplicate System Instance Modal -->
+<div id="duplicateModal" class="modal-backdrop" style="display:none">
+    <div class="modal-dialog" style="max-width:540px">
+        <div class="modal-header">
+            <h3><span>📋</span> <span id="dupModalTitle">Duplicate System / Application Instance</span></h3>
+            <button type="button" class="modal-close" onclick="closeDuplicateModal()" title="Close">&times;</button>
+        </div>
+        <form method="post" action="/" data-action="site_clone" id="duplicateForm">
+            <?= csrf_field() ?>
+            <input type="hidden" name="action" value="site_clone">
+            <input type="hidden" name="site" id="dupSourceInput" value="">
+            <input type="hidden" name="back" value="sites">
+
+            <div class="modal-body" style="display:flex;flex-direction:column;gap:14px">
+                <div style="background:#0c1524;border:1px solid #1f3a5f;border-radius:6px;padding:10px 14px;display:flex;justify-content:space-between;align-items:center">
+                    <div>
+                        <div style="font-size:0.75rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px">Source System</div>
+                        <div style="font-size:0.95rem;font-weight:700;color:#79c0ff" id="dupSourceLabel">app</div>
+                    </div>
+                    <span class="pill" id="dupSourceStackBadge" style="background:#1f3322;color:#7ee787">⚡ Laravel</span>
+                </div>
+
+                <div>
+                    <label style="display:block;font-size:0.84rem;font-weight:600;color:#c9d1d9;margin-bottom:6px">
+                        New System Name / Instance ID <span style="color:#f85149">*</span>
+                    </label>
+                    <input type="text" name="new_name" id="dupNewNameInput" required pattern="[a-z0-9_-]+"
+                        placeholder="e.g. app-v2, app-staging, app-admin"
+                        oninput="updateDuplicatePreview()"
+                        style="width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #388bfd;color:#e6edf3;padding:8px 12px;border-radius:6px;font-size:0.88rem;font-family:monospace">
+                    <div style="font-size:0.76rem;color:#8b949e;margin-top:4px">
+                        New URL: <code id="dupUrlPreview" style="color:#7ee787">/app-v2/</code>
+                    </div>
+                </div>
+
+                <div>
+                    <label style="display:block;font-size:0.84rem;font-weight:600;color:#c9d1d9;margin-bottom:6px">
+                        🌐 Dedicated Listening Port (Optional)
+                    </label>
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <input type="number" name="port" id="dupPortInput" min="1" max="65535"
+                            placeholder="e.g. 8081, 8082, 3000"
+                            style="flex:1;background:#0d1117;border:1px solid #30363d;color:#e6edf3;padding:8px 12px;border-radius:6px;font-size:0.88rem">
+                        <button type="button" class="btn" onclick="suggestNextPort()" style="font-size:0.8rem;white-space:nowrap" title="Auto-select next available port">
+                            💡 Suggest Next
+                        </button>
+                    </div>
+                    <div style="font-size:0.76rem;color:#8b949e;margin-top:4px">
+                        Leave blank to serve under URL subpath on Port 80, or assign a dedicated port to isolate this version/part of the system.
+                    </div>
+                </div>
+
+                <div id="dupDbOptionsBox" style="background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:12px">
+                    <div style="font-size:0.84rem;font-weight:600;color:#c9d1d9;margin-bottom:8px;display:flex;align-items:center;gap:6px">
+                        🗄️ Database Duplication
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:8px">
+                        <label style="font-size:0.82rem;color:#c9d1d9;display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+                            <input type="radio" name="db_mode" value="clone" checked style="margin-top:2px">
+                            <div>
+                                <b>Clone Database &amp; Data</b> <span class="pill ok" style="font-size:0.65rem">Recommended</span>
+                                <div style="font-size:0.74rem;color:#8b949e">Creates a new database and clones all tables and data from the source system.</div>
+                            </div>
+                        </label>
+                        <label style="font-size:0.82rem;color:#c9d1d9;display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+                            <input type="radio" name="db_mode" value="new" style="margin-top:2px">
+                            <div>
+                                <b>Fresh Empty Database</b>
+                                <div style="font-size:0.74rem;color:#8b949e">Creates a new blank database with fresh credentials and app key.</div>
+                            </div>
+                        </label>
+                        <label style="font-size:0.82rem;color:#c9d1d9;display:flex;align-items:flex-start;gap:8px;cursor:pointer">
+                            <input type="radio" name="db_mode" value="share" style="margin-top:2px">
+                            <div>
+                                <b>Share Same Database</b>
+                                <div style="font-size:0.74rem;color:#8b949e">Both systems share the same database tables (use with caution).</div>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <div>
+                    <label style="font-size:0.84rem;color:#c9d1d9;display:flex;align-items:center;gap:8px;cursor:pointer">
+                        <input type="checkbox" name="activate" value="1" checked>
+                        <span>⚡ <b>Spin up live in RAM immediately</b> (both versions run side-by-side)</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="modal-footer" style="display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid #21262d">
+                <button type="button" class="btn" onclick="closeDuplicateModal()">Cancel</button>
+                <button type="submit" class="btn-pri" style="background:#238636;border-color:#2ea043;font-weight:600">
+                    🚀 Duplicate &amp; Launch
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <script>
 (function() {
+    const usedSitePorts = <?= json_encode(array_values(array_filter(array_map(fn($s) => !empty($s['port']) ? (int)$s['port'] : null, $sites)))) ?>;
+
+    window.openDuplicateModal = function(sourceSite, stack, port, isActive) {
+        document.getElementById('dupSourceInput').value = sourceSite;
+        document.getElementById('dupSourceLabel').textContent = sourceSite;
+        
+        const badge = document.getElementById('dupSourceStackBadge');
+        if (badge) {
+            badge.textContent = stack ? (stack === 'laravel' ? '⚡ Laravel' : (stack === 'spa' ? '⚛️ SPA' : (stack === 'php' ? '🐘 PHP' : stack.toUpperCase()))) : 'APP';
+        }
+        
+        // Auto-suggest new name: source + '-v2'
+        let suggested = sourceSite + '-v2';
+        document.getElementById('dupNewNameInput').value = suggested;
+        window.updateDuplicatePreview();
+        
+        // Suggest port if source had a port or auto-select next
+        document.getElementById('dupPortInput').value = '';
+        if (port) {
+            let p = parseInt(port, 10) + 1;
+            while (usedSitePorts.includes(p)) p++;
+            document.getElementById('dupPortInput').value = p;
+        }
+        
+        const modal = document.getElementById('duplicateModal');
+        if (modal) {
+            modal.style.display = 'flex';
+            document.getElementById('dupNewNameInput').focus();
+        }
+    };
+
+    window.closeDuplicateModal = function() {
+        const modal = document.getElementById('duplicateModal');
+        if (modal) modal.style.display = 'none';
+    };
+
+    window.updateDuplicatePreview = function() {
+        const name = (document.getElementById('dupNewNameInput').value || '').trim();
+        const slug = name.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+        const preview = document.getElementById('dupUrlPreview');
+        if (preview) {
+            preview.textContent = '/' + (slug || 'new-instance') + '/';
+        }
+    };
+
+    window.suggestNextPort = function() {
+        let nextPort = 8081;
+        while (usedSitePorts.includes(nextPort)) {
+            nextPort++;
+        }
+        document.getElementById('dupPortInput').value = nextPort;
+    };
     let currentReuploadSite = '';
     let currentReuploadActive = false;
     let currentReuploadIsPrimary = false;
@@ -267,10 +487,77 @@ $st = wj('status');
         if (siteLabel) siteLabel.textContent = siteName;
         if (spinCheck) spinCheck.checked = currentReuploadActive;
         if (progressBox) progressBox.style.display = 'none';
+        loadReuploadRecentPrefs();
+
+    if (!window.isSecureContext) {
+        const rHint = document.getElementById('reuploadHttpsHint');
+        const rLink = document.getElementById('reuploadHttpsLink');
+        if (rHint && rLink) {
+            const targetHost = window.location.hostname || 'pilabwtc.local';
+            rLink.href = 'https://' + targetHost + ':4486' + window.location.pathname + window.location.search;
+            rHint.style.display = 'block';
+        }
+    }
 
         applyReuploadPreset(currentReuploadStack || 'auto');
         if (modal) modal.style.display = 'flex';
     };
+
+    window.loadReuploadRecentPrefs = function() {
+        const chk = document.getElementById('reuploadRecentOnly');
+        const mins = document.getElementById('reuploadRecentMins');
+        try {
+            const savedEnabled = localStorage.getItem('wtc_reupload_recent_only');
+            const savedMins = localStorage.getItem('wtc_reupload_recent_mins');
+            if (chk) chk.checked = savedEnabled === null ? true : (savedEnabled === '1');
+            if (mins) {
+                const parsed = parseInt(savedMins || '3', 10);
+                mins.value = (!isNaN(parsed) && parsed > 0) ? String(parsed) : '3';
+            }
+        } catch (_) {}
+    };
+
+    window.saveReuploadRecentPrefs = function() {
+        const chk = document.getElementById('reuploadRecentOnly');
+        const mins = document.getElementById('reuploadRecentMins');
+        try {
+            if (chk) localStorage.setItem('wtc_reupload_recent_only', chk.checked ? '1' : '0');
+            if (mins) {
+                const parsed = parseInt(mins.value, 10);
+                if (!isNaN(parsed) && parsed > 0) {
+                    localStorage.setItem('wtc_reupload_recent_mins', String(parsed));
+                }
+            }
+        } catch (_) {}
+    };
+
+    function getReuploadRecentMinutes() {
+        const chk = document.getElementById('reuploadRecentOnly');
+        const mins = document.getElementById('reuploadRecentMins');
+        try {
+            const savedEnabled = localStorage.getItem('wtc_reupload_recent_only');
+            const savedMins = localStorage.getItem('wtc_reupload_recent_mins');
+            const enabled = chk ? chk.checked : (savedEnabled === null ? true : savedEnabled === '1');
+            if (!enabled) return 0;
+            const rawVal = mins ? mins.value : (savedMins || '3');
+            const parsed = parseInt(rawVal, 10);
+            return (!isNaN(parsed) && parsed > 0) ? parsed : 3;
+        } catch (_) {
+            return (chk && !chk.checked) ? 0 : 3;
+        }
+    }
+
+    loadReuploadRecentPrefs();
+
+    if (!window.isSecureContext) {
+        const rHint = document.getElementById('reuploadHttpsHint');
+        const rLink = document.getElementById('reuploadHttpsLink');
+        if (rHint && rLink) {
+            const targetHost = window.location.hostname || 'pilabwtc.local';
+            rLink.href = 'https://' + targetHost + ':4486' + window.location.pathname + window.location.search;
+            rHint.style.display = 'block';
+        }
+    }
 
     window.applyReuploadPreset = function(preset) {
         if (!preset || preset === 'auto') {
@@ -496,7 +783,7 @@ $st = wj('status');
                 if (window.wtcSpa) {
                     window.wtcSpa.hideLoadingModal();
                     if (data.ok) {
-                        window.wtcSpa.showFlash('ok', `Site '${siteName}' updated successfully!` + (data.spun_up ? ' (active in RAM)' : ''));
+                        window.wtcSpa.showFlash('ok', `Site '${siteName}' updated directly in RAM!` + (data.catalog_rebuilding ? ' (rebuilding SD catalog in background)' : (data.spun_up ? ' (active in RAM)' : '')));
                         window.wtcSpa.navigateTo('/?p=sites', false);
                     } else {
                         window.wtcSpa.showFlash('err', 'Update failed: ' + (data.error || 'Server error'));
@@ -515,11 +802,25 @@ $st = wj('status');
             });
     }
 
+    window.browseReuploadFolder = function() {
+        const spinCheck = document.getElementById('reuploadSpinUp');
+        const shouldSpin = spinCheck ? spinCheck.checked : true;
+        if (window.wtcDropzone && window.wtcDropzone.pickDirectoryFast) {
+            window.wtcDropzone.pickDirectoryFast('reuploadFolderInput', (list) => {
+                executeReuploadFolder(list, currentReuploadSite, shouldSpin, currentReuploadIsPrimary);
+            });
+        } else {
+            const inp = document.getElementById('reuploadFolderInput');
+            if (inp) inp.click();
+        }
+    };
+
     async function executeReuploadFolder(filesWithPaths, siteName, shouldSpin, isPrimary = false) {
         const protPatterns = getReuploadProtectedPatterns();
+        const recentMinutes = getReuploadRecentMinutes();
         closeReuploadModal();
         if (window.wtcDropzone && window.wtcDropzone.uploadFolderForSite) {
-            window.wtcDropzone.uploadFolderForSite(filesWithPaths, siteName, shouldSpin, protPatterns, isPrimary);
+            window.wtcDropzone.uploadFolderForSite(filesWithPaths, siteName, shouldSpin, protPatterns, isPrimary, recentMinutes);
             return;
         }
     }
@@ -620,6 +921,9 @@ $st = wj('status');
                 <button type="button" class="btn" style="font-size:0.78rem;padding:3px 8px" onclick="runSingleArtisan('<?= h($activeSite) ?>', 'view:clear')">
                     👁️ view:clear
                 </button>
+                <button type="button" class="btn" style="font-size:0.78rem;padding:3px 8px;border-color:#8957e5;color:#d2a8ff" onclick="runSingleArtisan('<?= h($activeSite) ?>', 'ziggy:generate')">
+                    🔀 ziggy:generate
+                </button>
                 <button type="button" class="btn" style="font-size:0.78rem;padding:3px 8px" onclick="runSingleArtisan('<?= h($activeSite) ?>', 'storage:link --force')">
                     🔗 storage:link
                 </button>
@@ -659,6 +963,10 @@ $st = wj('status');
                         <label style="font-size:0.82rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
                             <input type="checkbox" name="run_optimize" value="1">
                             <span>Re-cache routes/config (<code>optimize</code>)</span>
+                        </label>
+                        <label style="font-size:0.82rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
+                            <input type="checkbox" name="run_ziggy_generate" value="1">
+                            <span>Rebuild Ziggy routes (<code>ziggy:generate</code>)</span>
                         </label>
                     </div>
                 </div>
@@ -715,6 +1023,8 @@ $st = wj('status');
                         <option value="config:cache">Create configuration cache</option>
                         <option value="cache:clear">Flush application cache</option>
                         <option value="view:clear">Clear compiled view files</option>
+                        <option value="ziggy:generate">Rebuild Ziggy JS route definitions</option>
+                        <option value="ziggy:generate --types">Rebuild Ziggy JS + TypeScript types</option>
                         <option value="storage:link --force">Create storage symbolic link</option>
                         <option value="migrate --force">Run database migrations</option>
                         <option value="migrate:status">Show migration status</option>
@@ -813,3 +1123,84 @@ $st = wj('status');
         </form>
     </div>
 </div>
+
+<!-- Rollback Version Selector & Manager Modal -->
+<div id="rollbackModal" class="modal-backdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9999;align-items:center;justify-content:center;padding:16px">
+    <div class="card" style="width:100%;max-width:620px;max-height:85vh;overflow:auto;border-color:#d29922;margin:0">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;border-bottom:1px solid #30363d;padding-bottom:8px">
+            <h3 style="margin:0;color:#e3b341">⏪ Rollbacks — <span id="rbModalSite"></span></h3>
+            <button type="button" class="btn" onclick="closeRollbackModal()">✕ Close</button>
+        </div>
+        <p style="font-size:0.84rem;color:#8b949e;margin-top:0">
+            Select a snapshot to restore (the current version is saved automatically before restoring), or delete snapshots to free SD storage.
+        </p>
+        <div id="rbModalList" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px"></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #30363d;padding-top:10px">
+            <span id="rbModalTotal" style="font-size:0.8rem;color:#8b949e"></span>
+            <form method="post" onsubmit="return confirm('Clear ALL saved rollback snapshots for this site?')" style="margin:0">
+                <?= csrf_field() ?>
+                <input type="hidden" name="action" value="rollback_clear">
+                <input type="hidden" name="back" value="sites">
+                <input type="hidden" name="site" id="rbClearSite" value="">
+                <button type="submit" class="danger">🧹 Clear All for Site</button>
+            </form>
+        </div>
+    </div>
+</div>
+<script>
+function fmtRbBytes(b) {
+    if (!b || b <= 0) return '0 B';
+    const u = ['B','KB','MB','GB'];
+    let i = 0;
+    while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+    return (i === 0 ? Math.round(b) : b.toFixed(1)) + ' ' + u[i];
+}
+function openRollbackModal(site, list) {
+    document.getElementById('rbModalSite').textContent = site;
+    document.getElementById('rbClearSite').value = site;
+    const container = document.getElementById('rbModalList');
+    container.innerHTML = '';
+    let total = 0;
+    const csrfVal = <?= json_encode(csrf()) ?>;
+    if (!Array.isArray(list) || list.length === 0) {
+        container.innerHTML = '<div style="color:#8b949e;padding:12px;text-align:center">No rollback snapshots found.</div>';
+    } else {
+        list.forEach((item, idx) => {
+            total += Number(item.size || 0);
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px;flex-wrap:wrap';
+            const dt = item.mtime ? new Date(item.mtime * 1000).toLocaleString() : item.label;
+            const badge = idx === 0 ? '<span class="pill ok" style="font-size:0.68rem;margin-left:6px">Latest</span>' : '';
+            row.innerHTML = `
+                <div>
+                    <div style="font-weight:600;font-size:0.86rem"><code>${item.label}</code>${badge}</div>
+                    <div style="font-size:0.76rem;color:#8b949e;margin-top:2px">${dt} · ${fmtRbBytes(item.size)}</div>
+                </div>
+                <div style="display:flex;gap:6px;align-items:center">
+                    <form method="post" style="margin:0" onsubmit="return confirm('Restore ${site} to ${item.label}?')">
+                        <input type="hidden" name="csrf" value="${csrfVal}">
+                        <input type="hidden" name="action" value="rollback">
+                        <input type="hidden" name="back" value="sites">
+                        <input type="hidden" name="site" value="${site}">
+                        <input type="hidden" name="version" value="${item.id}">
+                        <button type="submit" class="btn-pri" style="padding:4px 10px;font-size:0.78rem">⏪ Restore</button>
+                    </form>
+                    <form method="post" style="margin:0" onsubmit="return confirm('Delete rollback snapshot ${item.label}?')">
+                        <input type="hidden" name="csrf" value="${csrfVal}">
+                        <input type="hidden" name="action" value="rollback_delete">
+                        <input type="hidden" name="back" value="sites">
+                        <input type="hidden" name="site" value="${site}">
+                        <input type="hidden" name="version" value="${item.id}">
+                        <button type="submit" class="danger" style="padding:4px 8px;font-size:0.78rem">🗑️</button>
+                    </form>
+                </div>`;
+            container.appendChild(row);
+        });
+    }
+    document.getElementById('rbModalTotal').textContent = 'Total stored: ' + fmtRbBytes(total);
+    document.getElementById('rollbackModal').style.display = 'flex';
+}
+function closeRollbackModal() {
+    document.getElementById('rollbackModal').style.display = 'none';
+}
+</script>

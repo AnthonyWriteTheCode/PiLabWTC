@@ -30,8 +30,12 @@ $hostIp = explode(' ', $deviceStatus['ips'] ?? '')[0] ?? ($_SERVER['SERVER_ADDR'
             <div class="dropzone-title" id="dropTitle">Drag &amp; Drop Folder or Archive Here</div>
             <div class="dropzone-sub" id="dropSub">Drop from Windows Explorer or click to browse</div>
             <div class="dropzone-buttons" id="dropActionBtns">
-                <button type="button" class="btn" onclick="document.getElementById('folderInput').click()">📁 Browse Folder</button>
+                <button type="button" class="btn" onclick="browseMainFolder()">📁 Browse Folder</button>
                 <button type="button" class="btn" onclick="document.getElementById('archiveInput').click()">📦 Browse Archive / Files</button>
+            </div>
+            <div id="dropHttpsHint" style="display:none;margin-top:10px;font-size:0.78rem;color:#8b949e">
+                💡 Tip: <a id="dropHttpsLink" href="#" class="no-spa" style="color:#79c0ff;text-decoration:underline">Switch to HTTPS (port 4486)</a> to skip indexing <code>node_modules</code> &amp; <code>vendor</code> when browsing folders.
+                <a href="/?download_ui_cert=1" download="pilabwtc-ui.crt" class="btn no-spa" style="margin-left:8px;padding:2px 8px;font-size:0.74rem">🔐 Download HTTPS Cert (.crt)</a>
             </div>
             <input type="file" id="folderInput" webkitdirectory directory style="display:none">
             <input type="file" id="archiveInput" multiple accept=".zip,.tar,.gz,.tgz,.tar.gz,text/html,application/x-php" style="display:none">
@@ -191,6 +195,10 @@ $hostIp = explode(' ', $deviceStatus['ips'] ?? '')[0] ?? ($_SERVER['SERVER_ADDR'
                     <label style="font-size:0.84rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
                         <input type="checkbox" id="envChkOptimizeClear" checked onchange="syncDbCheckboxes('env')">
                         <span>✨ <b>Clear all caches</b> (<code>php artisan optimize:clear</code>)</span>
+                    </label>
+                    <label style="font-size:0.84rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
+                        <input type="checkbox" id="envChkZiggy" checked onchange="syncDbCheckboxes('env')">
+                        <span>🔀 <b>Rebuild Ziggy</b> (<code>php artisan ziggy:generate</code>)</span>
                     </label>
                     <label style="font-size:0.84rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
                         <input type="checkbox" id="envChkMigrate" checked onchange="syncDbCheckboxes('env')">
@@ -371,6 +379,10 @@ $hostIp = explode(' ', $deviceStatus['ips'] ?? '')[0] ?? ($_SERVER['SERVER_ADDR'
                             <span>✨ <b>Clear All Caches</b> (<code>php artisan optimize:clear</code>)</span>
                         </label>
                         <label style="font-size:0.85rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
+                            <input type="checkbox" id="modalChkZiggy" checked onchange="syncDbCheckboxes('modal')">
+                            <span>🔀 <b>Rebuild Ziggy</b> (<code>php artisan ziggy:generate</code>)</span>
+                        </label>
+                        <label style="font-size:0.85rem;color:#c9d1d9;display:flex;align-items:center;gap:6px;cursor:pointer">
                             <input type="checkbox" id="modalChkMigrate" checked onchange="syncDbCheckboxes('modal')">
                             <span>⚡ <b>Run Migrations</b> (<code>php artisan migrate</code>)</span>
                         </label>
@@ -383,6 +395,15 @@ $hostIp = explode(' ', $deviceStatus['ips'] ?? '')[0] ?? ($_SERVER['SERVER_ADDR'
                             <span>🔗 <b>Link Storage</b> (<code>php artisan storage:link</code>)</span>
                         </label>
                     </div>
+                </div>
+
+                <div style="background:#11171e;border:1px solid #21262d;border-radius:6px;padding:8px 12px;margin-bottom:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:0.83rem;color:#c9d1d9">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                        <input type="checkbox" id="dropRecentOnly" onchange="onDropRecentFilterChange()">
+                        <span>⏱️ <b>Only upload files saved in the past</b></span>
+                    </label>
+                    <input type="number" id="dropRecentMins" value="3" min="1" max="10080" oninput="onDropRecentFilterChange()" style="width:62px;background:#0d1117;color:#79c0ff;border:1px solid #30363d;border-radius:4px;padding:2px 6px;font-size:0.82rem;text-align:center;font-weight:600">
+                    <span style="color:#8b949e;font-size:0.8rem">minutes <span style="font-size:0.74rem">(overlays onto existing site if present)</span></span>
                 </div>
 
                 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px">
@@ -793,12 +814,24 @@ window.WTC_EXISTING_SITES = <?= json_encode(array_column(wj('sites'), 'name')) ?
             entries = entries.concat(batch);
         } while (batch && batch.length > 0);
 
+        const ignoredDirs = ['node_modules', 'vendor', '.git', '.github', '.idea', '.vscode', '.phpunit.cache', 'coverage'];
         for (const entry of entries) {
             const fullPath = path ? (path + '/' + entry.name) : entry.name;
             if (entry.isFile) {
                 const file = await new Promise((res, rej) => entry.file(res, rej));
                 list.push({ file, path: fullPath });
             } else if (entry.isDirectory) {
+                const dirLower = entry.name.toLowerCase();
+                if (ignoredDirs.includes(dirLower)) {
+                    // Do not freeze the browser by deeply scanning 300k+ transient files.
+                    // Keep a single placeholder marker so the folder exclusion UI knows this directory exists.
+                    list.push({
+                        file: new File([""], entry.name + '/.wtc-placeholder', { type: "text/plain" }),
+                        path: fullPath + '/.wtc-placeholder',
+                        isPlaceholder: true
+                    });
+                    continue;
+                }
                 await readDirectoryRecursive(entry, fullPath, list);
             }
         }
@@ -1218,19 +1251,69 @@ window.WTC_EXISTING_SITES = <?= json_encode(array_column(wj('sites'), 'name')) ?
         }
     }
 
+    function getDropRecentMinutes() {
+        const chk = document.getElementById('dropRecentOnly');
+        const mins = document.getElementById('dropRecentMins');
+        if (!chk || !chk.checked) return 0;
+        const parsed = parseInt(mins ? mins.value : '3', 10);
+        return (!isNaN(parsed) && parsed > 0) ? parsed : 3;
+    }
+
+    function loadDropRecentPrefs() {
+        const chk = document.getElementById('dropRecentOnly');
+        const mins = document.getElementById('dropRecentMins');
+        try {
+            const savedEnabled = localStorage.getItem('wtc_drop_recent_only');
+            const savedMins = localStorage.getItem('wtc_reupload_recent_mins');
+            if (chk && savedEnabled !== null) chk.checked = (savedEnabled === '1');
+            if (mins && savedMins) {
+                const parsed = parseInt(savedMins, 10);
+                if (!isNaN(parsed) && parsed > 0) mins.value = String(parsed);
+            }
+        } catch (_) {}
+    }
+
+    window.onDropRecentFilterChange = function() {
+        const chk = document.getElementById('dropRecentOnly');
+        const mins = document.getElementById('dropRecentMins');
+        try {
+            if (chk) localStorage.setItem('wtc_drop_recent_only', chk.checked ? '1' : '0');
+            if (mins) {
+                const parsed = parseInt(mins.value, 10);
+                if (!isNaN(parsed) && parsed > 0) {
+                    localStorage.setItem('wtc_reupload_recent_mins', String(parsed));
+                }
+            }
+        } catch (_) {}
+        updateFilterSummary();
+    };
+
+    loadDropRecentPrefs();
+
     function getFilteredStagedFiles() {
         if (!stagedFiles || stagedFiles.length === 0) return [];
-        if (Object.keys(folderFilterState).length === 0) return stagedFiles;
+        const hasFolderFilter = Object.keys(folderFilterState).length > 0;
+        const recentMins = getDropRecentMinutes();
+        const cutoffMs = recentMins > 0 ? (Date.now() - recentMins * 60 * 1000) : 0;
 
         return stagedFiles.filter(item => {
-            const rel = (item.path || '').replace(/\\/g, '/').replace(/^\/+/, '');
-            const parts = rel.split('/').filter(p => p !== '' && p !== '.' && p !== '..');
-            const top = parts.length > 1 ? parts[0] : '(root files)';
-            
-            // Check if top is allowed in folderFilterState
-            if (folderFilterState.hasOwnProperty(top)) {
-                return folderFilterState[top] === true;
+            if (item.isPlaceholder) return false;
+
+            if (hasFolderFilter) {
+                const rel = (item.path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+                const parts = rel.split('/').filter(p => p !== '' && p !== '.' && p !== '..');
+                const top = parts.length > 1 ? parts[0] : '(root files)';
+                if (folderFilterState.hasOwnProperty(top) && folderFilterState[top] !== true) {
+                    return false;
+                }
             }
+
+            if (recentMins > 0) {
+                if (!item.file || typeof item.file.lastModified !== 'number' || item.file.lastModified < cutoffMs) {
+                    return false;
+                }
+            }
+
             return true;
         });
     }
@@ -1381,6 +1464,7 @@ window.WTC_EXISTING_SITES = <?= json_encode(array_column(wj('sites'), 'name')) ?
         const pairs = [
             ['modalChkRouteClear', 'envChkRouteClear'],
             ['modalChkOptimizeClear', 'envChkOptimizeClear'],
+            ['modalChkZiggy', 'envChkZiggy'],
             ['modalChkMigrate', 'envChkMigrate'],
             ['modalChkSeed', 'envChkSeed'],
             ['modalChkStorageLink', 'envChkStorageLink']
@@ -1562,6 +1646,9 @@ REDIS_PORT=6379`;
 
     // Standalone in-browser ZIP generator (Store method 0, UTF-8 paths, standard PKZip format)
     async function createZipFromFiles(fileItems, onProgress) {
+        if (fileItems.length > 65000) {
+            throw new Error(`In-browser packaging cannot package ${fileItems.length.toLocaleString()} files (exceeds PKZip 65,535 entry limit). Please upload a pre-compressed .tar.gz or .zip archive directly.`);
+        }
         const crcTable = new Uint32Array(256);
         for (let i = 0; i < 256; i++) {
             let c = i;
@@ -1670,12 +1757,14 @@ REDIS_PORT=6379`;
     function appendArtisanPreferences(fd) {
         const runRouteClear = (document.getElementById('modalChkRouteClear')?.checked ?? document.getElementById('envChkRouteClear')?.checked);
         const runOptimizeClear = (document.getElementById('modalChkOptimizeClear')?.checked ?? document.getElementById('envChkOptimizeClear')?.checked);
+        const runZiggy = (document.getElementById('modalChkZiggy')?.checked ?? document.getElementById('envChkZiggy')?.checked);
         const runStorageLink = (document.getElementById('modalChkStorageLink')?.checked ?? document.getElementById('envChkStorageLink')?.checked);
         const runMigrate = (document.getElementById('modalChkMigrate')?.checked ?? document.getElementById('envChkMigrate')?.checked);
         const runSeed = (document.getElementById('modalChkSeed')?.checked ?? document.getElementById('envChkSeed')?.checked);
 
         if (runRouteClear !== undefined) fd.append('run_route_clear', runRouteClear ? '1' : '0');
         if (runOptimizeClear !== undefined) fd.append('run_optimize_clear', runOptimizeClear ? '1' : '0');
+        if (runZiggy !== undefined) fd.append('run_ziggy_generate', runZiggy ? '1' : '0');
         if (runStorageLink !== undefined) fd.append('run_storage_link', runStorageLink ? '1' : '0');
         if (runMigrate) fd.append('run_migrations', '1');
         if (runSeed) fd.append('run_seeds', '1');
@@ -1685,6 +1774,10 @@ REDIS_PORT=6379`;
         const filesToUpload = getFilteredStagedFiles();
         if (filesToUpload.length === 0) {
             alert('No files selected for upload. Please check at least one folder in the filter list.');
+            return;
+        }
+        if (filesToUpload.length > 65000) {
+            alert(`Selected folder contains ${filesToUpload.length.toLocaleString()} files, which exceeds the browser in-memory packaging limit of 65,000 files.\n\nFor large sites (such as 400,000 files / 3.5GB), please compress the folder into a .tar.gz or .zip archive on your computer and drop the archive directly!`);
             return;
         }
         syncGuidedToRaw();
@@ -1713,6 +1806,13 @@ REDIS_PORT=6379`;
 
         // Attach protected patterns to prevent overwriting server configs
         fd.append('protected_patterns', JSON.stringify(getActiveProtectedPatterns()));
+
+        const recentMins = getDropRecentMinutes();
+        if (recentMins > 0) {
+            fd.append('incremental_upload', '1');
+            fd.append('recent_minutes', String(recentMins));
+            fd.append('uploaded_file_count', String(filesToUpload.length));
+        }
 
         // Try in-memory browser zip packaging for 1-file direct RAM streaming
         let packagedAsZip = false;
@@ -1759,7 +1859,7 @@ REDIS_PORT=6379`;
         sendUpload(fd);
     }
 
-    async function uploadFolderForSite(filesWithPaths, targetSiteName, forceSpinUp = true, customPatterns = null, isPrimary = null) {
+    async function uploadFolderForSite(filesWithPaths, targetSiteName, forceSpinUp = true, customPatterns = null, isPrimary = null, recentMinutes = 0) {
         const siteName = (targetSiteName || siteInput.value || 'site-' + Date.now()).toLowerCase().replace(/[^a-z0-9_-]/g, '-');
         siteInput.value = siteName;
         detectedStackId = detectStackFromPaths(filesWithPaths.map(x => x.path));
@@ -1775,12 +1875,59 @@ REDIS_PORT=6379`;
             } catch (_) {}
         }
 
-        const filtered = filesWithPaths.filter(item => {
-            const rel = item.path.replace(/\\/g, '/').replace(/^\/+/, '');
-            const top = rel.split('/')[0].toLowerCase();
+        // Detect common root folder prefix from the full file list before any time-filtering
+        let rootPrefix = '';
+        if (filesWithPaths.length > 0) {
+            const firstNorm = (filesWithPaths[0].path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+            const slashIdx = firstNorm.indexOf('/');
+            if (slashIdx > 0) {
+                const candidate = firstNorm.slice(0, slashIdx + 1);
+                const allSharePrefix = filesWithPaths.every(item => {
+                    const n = (item.path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+                    return n.startsWith(candidate);
+                });
+                if (allSharePrefix) {
+                    rootPrefix = candidate;
+                }
+            }
+        }
+
+        const normalizedItems = filesWithPaths
+            .filter(item => !item.isPlaceholder)
+            .map(item => {
+                let rel = (item.path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+                if (rootPrefix && rel.startsWith(rootPrefix)) {
+                    rel = rel.slice(rootPrefix.length);
+                }
+                return { file: item.file, path: rel, origPath: item.path };
+            })
+            .filter(item => item.path !== '');
+
+        const filtered = normalizedItems.filter(item => {
+            const top = item.path.split('/')[0].toLowerCase();
             return !['vendor', 'node_modules', '.git', '.github', 'storage'].includes(top);
         });
-        const uploadList = filtered.length > 0 ? filtered : filesWithPaths;
+        let uploadList = filtered.length > 0 ? filtered : normalizedItems;
+
+        const mins = parseInt(recentMinutes, 10) || 0;
+        const isIncremental = mins > 0;
+        if (isIncremental) {
+            const cutoffMs = Date.now() - (mins * 60 * 1000);
+            uploadList = uploadList.filter(item => item.file && typeof item.file.lastModified === 'number' && item.file.lastModified >= cutoffMs);
+            if (uploadList.length === 0) {
+                const msg = `No files in the selected folder were saved in the past ${mins} minute(s). Nothing to upload.`;
+                if (window.wtcSpa && window.wtcSpa.showFlash) {
+                    window.wtcSpa.showFlash('err', msg);
+                } else {
+                    alert(msg);
+                }
+                return;
+            }
+        } else {
+            // Keep original paths for full-folder uploads to preserve existing behavior
+            uploadList = uploadList.map(item => ({ file: item.file, path: item.origPath }));
+        }
+
         const prot = (customPatterns && customPatterns.length > 0) ? customPatterns : getActiveProtectedPatterns();
 
         const fd = new FormData();
@@ -1795,10 +1942,18 @@ REDIS_PORT=6379`;
         fd.append('deploy_mode', 'standard');
         fd.append('site', siteName);
         fd.append('protected_patterns', JSON.stringify(prot));
+        if (isIncremental) {
+            fd.append('incremental_upload', '1');
+            fd.append('recent_minutes', String(mins));
+            fd.append('uploaded_file_count', String(uploadList.length));
+        }
         appendArtisanPreferences(fd);
 
         try {
-            showProgress('📦 Packaging ' + uploadList.length + ' files in browser memory...', 10);
+            const packLabel = isIncremental
+                ? `📦 Packaging ${uploadList.length} file(s) saved in the past ${mins}m...`
+                : `📦 Packaging ${uploadList.length} files in browser memory...`;
+            showProgress(packLabel, 10);
             const zipBlob = await createZipFromFiles(uploadList, (cur, total) => {
                 const pct = Math.round((cur / total) * 30);
                 showProgress(`📦 Bundling files in memory: ${cur} / ${total}`, pct);
@@ -1813,7 +1968,10 @@ REDIS_PORT=6379`;
             });
         }
 
-        showProgress(`🚀 Streaming to auto-update '${siteName}' directly in RAM disk...`, 35);
+        const streamLabel = isIncremental
+            ? `🚀 Uploading ${uploadList.length} recently saved file(s) to overlay '${siteName}'...`
+            : `🚀 Streaming to auto-update '${siteName}' directly in RAM disk...`;
+        showProgress(streamLabel, 35);
         sendUpload(fd);
     }
 
@@ -1827,22 +1985,22 @@ REDIS_PORT=6379`;
     function sendUpload(fd) {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/');
-        xhr.timeout = 600000; // 10 minutes timeout for large sites
+        xhr.timeout = 3600000; // 1 hour timeout for very large multi-GB sites
         xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable) {
                 const pct = 30 + Math.round((e.loaded / e.total) * 65);
                 progressBar.style.width = pct + '%';
                 const loadedMb = Math.round((e.loaded / (1024 * 1024)) * 10) / 10;
                 const totalMb = Math.round((e.total / (1024 * 1024)) * 10) / 10;
-                progressStatus.textContent = `⚡ Spooling to RAM tmpfs: ${loadedMb} MB / ${totalMb} MB (${Math.round((e.loaded/e.total)*100)}%)`;
+                progressStatus.textContent = `⚡ Uploading site package: ${loadedMb} MB / ${totalMb} MB (${Math.round((e.loaded/e.total)*100)}%)`;
             }
         });
         xhr.ontimeout = function() {
-            alert('Upload timed out after 10 minutes. Check network bandwidth.');
+            alert('Upload timed out after 1 hour. Please check network bandwidth or Pi system resources.');
             progressBox.style.display = 'none';
         };
         xhr.onerror = function() {
-            alert('Network connection error while uploading to RAM. Please verify the Raspberry Pi is reachable.');
+            alert('Network connection error while uploading. Please verify the Raspberry Pi is reachable.');
             progressBox.style.display = 'none';
         };
         xhr.onreadystatechange = function() {
@@ -1878,10 +2036,24 @@ REDIS_PORT=6379`;
                                 </div>
                             ` : '';
 
+                            const incrementalHtml = res.incremental_upload ? `
+                                <div style="background:#0d1825;border:1px solid #388bfd;border-radius:6px;padding:8px 12px;margin:10px 0;text-align:left;font-size:0.82rem;color:#79c0ff">
+                                    ⏱️ <b>Incremental Re-upload:</b> Overlaid <b>${res.uploaded_file_count || 'modified'}</b> file(s) saved in the past <b>${res.recent_minutes || 3}</b> minute(s) onto existing site.
+                                </div>
+                            ` : '';
+
+                            const catalogHtml = res.catalog_rebuilding ? `
+                                <div style="background:#0d1825;border:1px solid #388bfd;border-radius:6px;padding:8px 12px;margin:10px 0;text-align:left;font-size:0.82rem;color:#79c0ff">
+                                    💾 <b>SD Catalog Sync:</b> Live site files were replaced directly in RAM for immediate access; rebuilding <code>${res.site}.tar.gz</code> on the SD card in the background.
+                                </div>
+                            ` : '';
+
                             resultBox.innerHTML = `
                                 <div class="success-banner">
                                     <h4>🎉 Success! Site '<b>${res.site}</b>' ${res.spun_up ? 'is LIVE in RAM!' : 'provisioned into sites repository!'}</h4>
                                     <p>${res.spun_up ? '🚀 Your application is live and running directly from RAM tmpfs storage.' : 'Site package saved to /opt/wtc-web/sites and ready to deploy.'}</p>
+                                    ${catalogHtml}
+                                    ${incrementalHtml}
                                     ${restoredHtml}
                                     ${dbHtml}
                                     ${artisanHtml}
@@ -1952,9 +2124,71 @@ REDIS_PORT=6379`;
         });
     }
 
+    async function walkDirectoryHandle(dirHandle, path, list) {
+        const ignoredDirs = ['node_modules', 'vendor', '.git', '.github', '.idea', '.vscode', '.phpunit.cache', 'coverage'];
+        for await (const entry of dirHandle.values()) {
+            const fullPath = path ? (path + '/' + entry.name) : entry.name;
+            if (entry.kind === 'file') {
+                const file = await entry.getFile();
+                list.push({ file, path: fullPath });
+            } else if (entry.kind === 'directory') {
+                const dirLower = entry.name.toLowerCase();
+                if (ignoredDirs.includes(dirLower)) {
+                    list.push({
+                        file: new File([''], entry.name + '/.wtc-placeholder', { type: 'text/plain' }),
+                        path: fullPath + '/.wtc-placeholder',
+                        isPlaceholder: true
+                    });
+                    continue;
+                }
+                await walkDirectoryHandle(entry, fullPath, list);
+            }
+        }
+    }
+
+    async function pickDirectoryFast(fallbackInputId, onFilesSelected) {
+        if (typeof window.showDirectoryPicker === 'function' && window.isSecureContext) {
+            try {
+                const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+                showProgress(`📂 Fast-scanning '${dirHandle.name}' (skipping node_modules, vendor, .git)...`, 8);
+                const list = [];
+                await walkDirectoryHandle(dirHandle, dirHandle.name, list);
+                progressBox.style.display = 'none';
+                onFilesSelected(list, dirHandle.name);
+                return true;
+            } catch (err) {
+                progressBox.style.display = 'none';
+                if (err && err.name === 'AbortError') {
+                    return false;
+                }
+                console.warn('showDirectoryPicker failed, falling back to webkitdirectory:', err);
+            }
+        }
+        const fallback = document.getElementById(fallbackInputId);
+        if (fallback) fallback.click();
+        return false;
+    }
+
+    window.browseMainFolder = function() {
+        pickDirectoryFast('folderInput', (list, rootName) => {
+            processScannedFiles(list, siteInput.value || rootName);
+        });
+    };
+
+    if (!window.isSecureContext) {
+        const hint = document.getElementById('dropHttpsHint');
+        const link = document.getElementById('dropHttpsLink');
+        if (hint && link) {
+            const targetHost = window.location.hostname || 'pilabwtc.local';
+            link.href = 'https://' + targetHost + ':4486' + window.location.pathname + window.location.search;
+            hint.style.display = 'block';
+        }
+    }
+
     window.wtcDropzone = {
         uploadSingleArchive,
         uploadFolderForSite,
+        pickDirectoryFast,
         readDirectoryRecursive,
         createZipFromFiles,
         showProgress,

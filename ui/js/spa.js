@@ -99,6 +99,36 @@
             sub: 'Executing apt background package management...',
             icon: '📦'
         },
+        'site_rename': {
+            title: '✏️ Renaming Site Package',
+            sub: 'Updating site archive, metadata, and routing configuration...',
+            icon: '✏️'
+        },
+        'site_clone': {
+            title: '📋 Duplicating System Instance',
+            sub: 'Cloning application files, configuring database, and provisioning routing...',
+            icon: '📋'
+        },
+        'site_duplicate': {
+            title: '📋 Duplicating System Instance',
+            sub: 'Cloning application files, configuring database, and provisioning routing...',
+            icon: '📋'
+        },
+        'site_stack': {
+            title: '🥞 Updating Site Stack',
+            sub: 'Configuring framework runtime profile and reloading Nginx routing...',
+            icon: '🥞'
+        },
+        'site_port': {
+            title: '🌐 Configuring Dedicated Port',
+            sub: 'Generating Nginx port listener and updating firewall rules...',
+            icon: '🌐'
+        },
+        'storage_link': {
+            title: '🔗 Linking Laravel Storage',
+            sub: 'Connecting public/storage to storage/app/public...',
+            icon: '🔗'
+        },
         'setting': {
             title: '⚙️ Applying Server Settings',
             sub: 'Updating system environment variables and persistence settings...',
@@ -499,7 +529,7 @@
             if (url.origin !== window.location.origin) return;
 
             // Never intercept file downloads with SPA router
-            if (url.searchParams.has('download')) return;
+            if (url.searchParams.has('download') || url.searchParams.has('download_ui_cert')) return;
 
             // Only intercept management UI links (/?p=... or /)
             if (url.pathname === '/' || url.pathname === '/index.php') {
@@ -510,6 +540,7 @@
 
         // 2. Intercept Form Submissions for SPA
         document.addEventListener('submit', (e) => {
+            if (e.defaultPrevented) return;
             const form = e.target;
             if (form && form.method && form.method.toLowerCase() === 'post') {
                 // If form has no-spa class or explicit target, skip

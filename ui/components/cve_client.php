@@ -64,9 +64,10 @@ if (!function_exists('debian_version_compare')) {
     function debian_version_compare(string $v1, string $v2): int {
         // Handle epochs
         $epoch1 = 0; $epoch2 = 0;
-        if (str_contains($v1, ':')) { [$e, $v1] = explode(':', $v1, 2); $epoch1 = (int)$e; }
-        if (str_contains($v2, ':')) { [$e, $v2] = explode(':', $v2, 2); $epoch2 = (int)$e; }
-        if ($epoch1 !== $epoch2) {
+        $hasEpoch1 = false; $hasEpoch2 = false;
+        if (str_contains($v1, ':')) { [$e, $v1] = explode(':', $v1, 2); $epoch1 = (int)$e; $hasEpoch1 = true; }
+        if (str_contains($v2, ':')) { [$e, $v2] = explode(':', $v2, 2); $epoch2 = (int)$e; $hasEpoch2 = true; }
+        if ($hasEpoch1 && $hasEpoch2 && $epoch1 !== $epoch2) {
             return $epoch1 <=> $epoch2;
         }
 
@@ -87,7 +88,10 @@ if (!function_exists('debian_version_compare')) {
         if ($cmpUpstream !== 0) {
             return $cmpUpstream;
         }
-        return debian_part_compare($rev1, $rev2);
+        if ($lastDash1 !== false && $lastDash2 !== false) {
+            return debian_part_compare($rev1, $rev2);
+        }
+        return 0;
     }
 }
 
@@ -103,11 +107,13 @@ if (!function_exists('cve_normalize_version')) {
         }
 
         // Strip leading daemon names e.g. "nginx/", "OpenSSH_", "PHP "
-        $raw = preg_replace('/^(?:php|nginx|openssh|mariadb|redis|samba|vsftpd)[\/_\s]+/i', '', $raw);
+        $raw = preg_replace('/^(?:php|nginx|openssh|mariadb|mysql|redis|samba|vsftpd|avahi|systemd)[\/_\s]+/i', '', $raw);
+        $raw = preg_replace('/-mariadb-/i', '-', $raw);
 
         // Strip trailing extra text e.g. " (cli) (built: ...)" or " Debian-..."
-        if (preg_match('/^([0-9]+(?:\.[0-9]+)*(?:p[0-9]+)?(?:-[0-9a-z.+~]+)?)/i', $raw, $m)) {
-            return strtolower($m[1]);
+        $raw = preg_replace('/\s+.*$/', '', $raw);
+        if (preg_match('/^([0-9]+:)?([0-9]+[0-9a-z.+~-]*)/i', $raw, $m)) {
+            return strtolower($m[0]);
         }
 
         return strtolower($raw);
@@ -149,9 +155,10 @@ if (!function_exists('is_cve_relevant_to_version')) {
             return false;
         }
         $instBranch = '';
-        if (preg_match('/^([0-9]+\.[0-9]+)/', $instNorm, $m)) {
+        $vWithoutEpoch = preg_replace('/^[0-9]+:/', '', $instNorm);
+        if (preg_match('/^([0-9]+\.[0-9]+)/', $vWithoutEpoch, $m)) {
             $instBranch = $m[1];
-        } elseif (preg_match('/^([0-9]+)/', $instNorm, $m)) {
+        } elseif (preg_match('/^([0-9]+)/', $vWithoutEpoch, $m)) {
             $instBranch = $m[1];
         }
 
@@ -205,6 +212,7 @@ if (!function_exists('version_in_affected_range')) {
         if ($inst === '' || $inst === '0.0.0') {
             return false;
         }
+        $instWithoutEpoch = preg_replace('/^[0-9]+:/', '', $inst);
 
         foreach ($rangeSpecs as $range) {
             $matched = true;
@@ -212,7 +220,7 @@ if (!function_exists('version_in_affected_range')) {
             // Prefix match (e.g. "8.5.*" matches any 8.5.x version)
             if (!empty($range['prefix'])) {
                 $pfx = rtrim((string)$range['prefix'], '.*');
-                if (!str_starts_with($inst, $pfx . '.') && $inst !== $pfx && !str_starts_with($inst, $pfx . '-')) {
+                if (!str_starts_with($instWithoutEpoch, $pfx . '.') && $instWithoutEpoch !== $pfx && !str_starts_with($instWithoutEpoch, $pfx . '-')) {
                     $matched = false;
                 }
             }
@@ -649,29 +657,17 @@ if (!function_exists('is_cve_patched')) {
             return false;
         }
 
-        $u = strtolower(preg_replace('/\.service$/', '', trim($unit)));
+        $u = strtolower(preg_replace('/\.(service|socket|timer|path|target)$/', '', trim($unit)));
         $c = strtoupper(trim($cveId));
         $instNorm = cve_normalize_version($installedVer);
 
-        // If the advisory specifies affected version ranges and the currently installed version
-        // falls within that vulnerable range, no receipt can mark it patched!
-        if ($instNorm !== '' && !empty($cveInfo['affected_ranges'])) {
-            if (version_in_affected_range($instNorm, $cveInfo['affected_ranges'])) {
-                return false;
-            }
-        }
-
-        // If the advisory specifies a target fixed version and the installed version is below it,
-        // it cannot be considered patched.
-        if ($instNorm !== '' && !empty($cveInfo['fixed_version'])) {
-            $fixedNorm = cve_normalize_version(rtrim((string)$cveInfo['fixed_version'], '+'));
-            if ($fixedNorm !== '' && cve_compare_versions($instNorm, $fixedNorm) < 0) {
-                return false;
-            }
-        }
+        // Check whether an official package upgrade is pending in apt repositories
+        $candVer = resolve_service_candidate_version($unit);
+        $candNorm = cve_normalize_version($candVer);
+        $hasPendingUpgrade = ($candNorm !== '' && $instNorm !== '' && cve_compare_versions($instNorm, $candNorm) < 0);
 
         foreach ($patches as $p) {
-            $pu = strtolower(preg_replace('/\.service$/', '', trim((string)($p['unit'] ?? ''))));
+            $pu = strtolower(preg_replace('/\.(service|socket|timer|path|target)$/', '', trim((string)($p['unit'] ?? ''))));
             $pc = strtoupper(trim((string)($p['cve'] ?? '')));
             $pVer = trim((string)($p['version'] ?? ''));
 
@@ -691,24 +687,30 @@ if (!function_exists('is_cve_patched')) {
             if (!$unitMatches && ((str_starts_with($u, 'smbd') || str_starts_with($u, 'samba')) && (str_starts_with($pu, 'smbd') || str_starts_with($pu, 'samba')))) {
                 $unitMatches = true;
             }
+            if (!$unitMatches && (str_starts_with($u, 'avahi') && str_starts_with($pu, 'avahi'))) {
+                $unitMatches = true;
+            }
+            if (!$unitMatches && (str_starts_with($u, 'systemd') && (str_starts_with($pu, 'systemd') || $pu === 'system'))) {
+                $unitMatches = true;
+            }
 
             if ($unitMatches) {
                 // Anti-downgrade check: If receipt recorded a package version and installed version is lower,
                 // the service has been downgraded. Invalidate receipt.
-                if ($instNorm !== '' && $pVer !== '' && $pVer !== 'hardened' && $pVer !== '127.0.0.1') {
+                if ($pu !== 'all' && $pu !== '*' && $instNorm !== '' && $pVer !== '' && $pVer !== 'hardened' && $pVer !== '127.0.0.1') {
                     $pVerNorm = cve_normalize_version($pVer);
                     if ($pVerNorm !== '' && cve_compare_versions($instNorm, $pVerNorm) < 0) {
                         return false;
                     }
                 }
 
-                // If this is a package binary CVE (has affected_ranges or fixed_version),
-                // a generic/wildcard receipt (like "ALL") from config hardening must NOT bypass it.
-                if (($pc === 'ALL' || $pc === '*') && (!empty($cveInfo['affected_ranges']) || !empty($cveInfo['fixed_version']))) {
-                    continue;
+                // If this is a package binary CVE and a newer candidate exists in apt,
+                // the package needs updating before receipt is considered active.
+                if ($hasPendingUpgrade && ($pc === 'ALL' || $pc === '*' || $pc === 'PACKAGE_UPGRADE')) {
+                    return false;
                 }
 
-                if ($pc === 'ALL' || $pc === '*' || $pc === $c || ($pc === 'PACKAGE_UPGRADE' && empty($cveInfo['affected_ranges']))) {
+                if ($pc === 'ALL' || $pc === '*' || $pc === $c || $pc === 'PACKAGE_UPGRADE') {
                     return true;
                 }
             }
@@ -734,17 +736,21 @@ if (!function_exists('check_service_downgrade')) {
             return null;
         }
 
-        $u = strtolower(preg_replace('/\.service$/', '', trim($unit)));
+        $u = strtolower(preg_replace('/\.(service|socket|timer|path|target)$/', '', trim($unit)));
         $highestRecordedVer = '';
 
         foreach ($patches as $p) {
-            $pu = strtolower(preg_replace('/\.service$/', '', trim((string)($p['unit'] ?? ''))));
-            $unitMatches = ($pu === 'all' || $pu === '*' || $pu === $u);
+            $pu = strtolower(preg_replace('/\.(service|socket|timer|path|target)$/', '', trim((string)($p['unit'] ?? ''))));
+            if ($pu === 'all' || $pu === '*') {
+                continue;
+            }
+            $unitMatches = ($pu === $u);
             if (!$unitMatches && (str_starts_with($u, 'php') && str_starts_with($pu, 'php'))) $unitMatches = true;
             if (!$unitMatches && ((str_starts_with($u, 'mariadb') || str_starts_with($u, 'mysql')) && ($pu === 'mariadb' || $pu === 'mysql'))) $unitMatches = true;
             if (!$unitMatches && ((str_starts_with($u, 'ssh') || str_starts_with($u, 'openssh')) && (str_starts_with($pu, 'ssh') || str_starts_with($pu, 'openssh')))) $unitMatches = true;
             if (!$unitMatches && (str_starts_with($u, 'redis') && str_starts_with($pu, 'redis'))) $unitMatches = true;
             if (!$unitMatches && ((str_starts_with($u, 'smbd') || str_starts_with($u, 'samba')) && (str_starts_with($pu, 'smbd') || str_starts_with($pu, 'samba')))) $unitMatches = true;
+            if (!$unitMatches && (str_starts_with($u, 'avahi') && str_starts_with($pu, 'avahi'))) $unitMatches = true;
 
             if ($unitMatches) {
                 $verStr = trim((string)($p['version'] ?? ''));
@@ -772,40 +778,124 @@ if (!function_exists('check_service_downgrade')) {
     }
 }
 
+if (!function_exists('cve_service_dpkg_candidates')) {
+    /**
+     * Ordered list of dpkg packages that own a core OS / systemd-family unit.
+     * Mirrors service_to_pkgs() in 02-manage-site.sh so scan and patch receipts agree.
+     */
+    function cve_service_dpkg_candidates(string $uBare): array {
+        $uBare = strtolower($uBare);
+        switch ($uBare) {
+            case 'systemd-resolved':  return ['systemd-resolved', 'systemd'];
+            case 'systemd-timesyncd': return ['systemd-timesyncd', 'systemd'];
+            case 'systemd-udevd':     return ['udev', 'systemd'];
+            case 'networkmanager':    return ['network-manager'];
+            case 'wpa_supplicant':    return ['wpasupplicant'];
+            case 'dbus':              return ['dbus'];
+            case 'cron':              return ['cron'];
+            case 'irqbalance':        return ['irqbalance'];
+            case 'memcached':         return ['memcached'];
+        }
+        if (str_starts_with($uBare, 'systemd')) {
+            return [$uBare, 'systemd'];
+        }
+        return [];
+    }
+}
+
+if (!function_exists('cve_apt_candidate')) {
+    /**
+     * Cached `apt-cache policy <pkg>` Candidate lookup.
+     * apt-cache is slow on a Pi (~0.2-1s per call) and the Services tab asks for the same
+     * packages many times per render (per unit and per CVE entry). Results are memoised per
+     * request and persisted to a small file cache that is invalidated automatically whenever
+     * dpkg state changes (install/upgrade) or apt lists are refreshed (apt update).
+     */
+    function cve_apt_candidate(string $pkg): string {
+        static $mem = null;
+        static $dirty = false;
+        static $file = null;
+        $ttl = 900;
+
+        if ($mem === null) {
+            $mem = [];
+            $file = sys_get_temp_dir() . '/wtc_apt_candidates.json';
+            $cacheMtime = @filemtime($file) ?: 0;
+            $stateMtime = max(
+                (int)(@filemtime('/var/lib/dpkg/status') ?: 0),
+                (int)(@filemtime('/var/lib/apt/lists') ?: 0),
+                (int)(@filemtime('/var/cache/apt/pkgcache.bin') ?: 0)
+            );
+            if ($cacheMtime > 0 && $cacheMtime >= $stateMtime && (time() - $cacheMtime) < $ttl) {
+                $d = json_decode((string)@file_get_contents($file), true);
+                if (is_array($d)) $mem = $d;
+            }
+            register_shutdown_function(function () use (&$mem, &$dirty, &$file) {
+                if ($dirty && $file) {
+                    @file_put_contents($file, json_encode($mem), LOCK_EX);
+                    @chmod($file, 0666);
+                }
+            });
+        }
+
+        if (array_key_exists($pkg, $mem)) {
+            return (string)$mem[$pkg];
+        }
+
+        $cand = '';
+        $out = @shell_exec("apt-cache policy " . escapeshellarg($pkg) . " 2>/dev/null");
+        if ($out && preg_match('/Candidate:\s*([^\s]+)/', $out, $m)) {
+            $c = trim($m[1]);
+            if ($c !== '(none)' && $c !== '' && $c !== '0') {
+                $cand = $c;
+            }
+        }
+        $mem[$pkg] = $cand;
+        $dirty = true;
+        return $cand;
+    }
+}
+
 if (!function_exists('resolve_service_candidate_version')) {
     /**
      * Resolves the candidate package version available in apt repositories.
      */
     function resolve_service_candidate_version(string $unit): string {
-        $uBare = strtolower(preg_replace('/\.service$/', '', trim($unit)));
+        $uBare = strtolower(preg_replace('/\.(service|socket|timer|path|target)$/', '', trim($unit)));
         $pkg = $uBare;
+        $sysCandidates = cve_service_dpkg_candidates($uBare);
+        if (!empty($sysCandidates)) {
+            foreach ($sysCandidates as $cPkg) {
+                $cand = cve_apt_candidate($cPkg);
+                if ($cand !== '') {
+                    return $cand;
+                }
+            }
+            return '';
+        }
         if (str_starts_with($uBare, 'php')) {
             if (preg_match('/php([0-9]+\.[0-9]+)/', $uBare, $m)) {
                 $pkg = 'php' . $m[1] . '-fpm';
+            } elseif (defined('PHP_MAJOR_VERSION') && defined('PHP_MINOR_VERSION')) {
+                $pkg = 'php' . PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION . '-fpm';
             } else {
                 $pkg = 'php-fpm';
             }
-        } elseif (in_array($uBare, ['nginx', 'mariadb', 'mysql', 'redis', 'vsftpd', 'samba', 'smbd'], true)) {
-            $map = [
-                'nginx' => 'nginx',
-                'mariadb' => 'mariadb-server',
-                'mysql' => 'mysql-server',
-                'redis' => 'redis-server',
-                'vsftpd' => 'vsftpd',
-                'samba' => 'samba',
-                'smbd' => 'samba'
-            ];
-            $pkg = $map[$uBare] ?? $uBare;
+        } elseif (str_starts_with($uBare, 'ssh')) {
+            $pkg = 'openssh-server';
+        } elseif (str_starts_with($uBare, 'avahi')) {
+            $pkg = 'avahi-daemon';
+        } elseif (str_starts_with($uBare, 'mariadb') || str_starts_with($uBare, 'mysql')) {
+            $pkg = 'mariadb-server';
+        } elseif (str_starts_with($uBare, 'redis')) {
+            $pkg = 'redis-server';
+        } elseif (str_starts_with($uBare, 'smbd') || str_starts_with($uBare, 'samba') || str_starts_with($uBare, 'nmbd')) {
+            $pkg = 'samba';
+        } elseif (in_array($uBare, ['nginx', 'vsftpd'], true)) {
+            $pkg = $uBare;
         }
 
-        $out = @shell_exec("apt-cache policy " . escapeshellarg($pkg) . " 2>/dev/null");
-        if ($out && preg_match('/Candidate:\s*([^\s]+)/', $out, $m)) {
-            $cand = trim($m[1]);
-            if ($cand !== '(none)' && $cand !== '' && $cand !== '0') {
-                return $cand;
-            }
-        }
-        return '';
+        return cve_apt_candidate($pkg);
     }
 }
 
@@ -814,17 +904,30 @@ if (!function_exists('resolve_service_version')) {
      * Resolves the installed version of a service unit from dpkg-query or daemon binary.
      */
     function resolve_service_version(string $unit): string {
+        // Memoised per request: the Services tab resolves each unit several times per render
+        static $memo = [];
+        $key = strtolower(trim($unit));
+        if (array_key_exists($key, $memo)) {
+            return $memo[$key];
+        }
+        return $memo[$key] = resolve_service_version_uncached($unit);
+    }
+}
+
+if (!function_exists('resolve_service_version_uncached')) {
+    function resolve_service_version_uncached(string $unit): string {
         $u = strtolower(trim($unit));
-        $uBare = preg_replace('/\.service$/', '', $u);
+        $uBare = preg_replace('/\.(service|socket|timer|path|target)$/', '', $u);
 
         $pkgMap = [
             'nginx' => 'nginx',
             'mariadb' => 'mariadb-server',
-            'mysql' => 'mysql-server',
+            'mysql' => 'mariadb-server',
             'ssh' => 'openssh-server',
             'sshd' => 'openssh-server',
             'smbd' => 'samba',
             'samba' => 'samba',
+            'nmbd' => 'samba',
             'redis' => 'redis-server',
             'redis-server' => 'redis-server',
             'vsftpd' => 'vsftpd',
@@ -832,16 +935,50 @@ if (!function_exists('resolve_service_version')) {
         ];
 
         $pkg = $pkgMap[$uBare] ?? '';
-        if (str_starts_with($uBare, 'php')) {
-            if (preg_match('/php([0-9]+\.[0-9]+)/', $uBare, $m)) {
-                $pkg = 'php' . $m[1] . '-fpm';
-            } else {
-                $pkg = 'php-fpm';
+        if ($pkg === '') {
+            if (str_starts_with($uBare, 'php')) {
+                if (preg_match('/php([0-9]+\.[0-9]+)/', $uBare, $m)) {
+                    $pkg = 'php' . $m[1] . '-fpm';
+                } elseif (defined('PHP_MAJOR_VERSION') && defined('PHP_MINOR_VERSION')) {
+                    $pkg = 'php' . PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION . '-fpm';
+                } else {
+                    $pkg = 'php-fpm';
+                }
+            } elseif (str_starts_with($uBare, 'ssh')) {
+                $pkg = 'openssh-server';
+            } elseif (str_starts_with($uBare, 'avahi')) {
+                $pkg = 'avahi-daemon';
+            } elseif (str_starts_with($uBare, 'mariadb') || str_starts_with($uBare, 'mysql')) {
+                $pkg = 'mariadb-server';
+            } elseif (str_starts_with($uBare, 'redis')) {
+                $pkg = 'redis-server';
+            } elseif (str_starts_with($uBare, 'smbd') || str_starts_with($uBare, 'samba')) {
+                $pkg = 'samba';
+            }
+        }
+
+        // systemd-family / core OS units: use the same dpkg packages the patcher records
+        // receipts against (see service_to_pkgs in 02-manage-site.sh). `systemctl --version`
+        // only reports the upstream major (e.g. "259"), which always compares lower than the
+        // recorded distro revision (e.g. "259.9-0ubuntu0.1") and causes false downgrade alerts.
+        if ($pkg === '') {
+            $candidates = cve_service_dpkg_candidates($uBare);
+            foreach ($candidates as $cPkg) {
+                $ver = @shell_exec("dpkg-query -W -f='\${Version}' " . escapeshellarg($cPkg) . " 2>/dev/null");
+                if ($ver && trim($ver) !== '') {
+                    return trim($ver);
+                }
             }
         }
 
         if ($pkg !== '') {
             $ver = @shell_exec("dpkg-query -W -f='\${Version}' " . escapeshellarg($pkg) . " 2>/dev/null");
+            if ((!$ver || trim($ver) === '') && $pkg === 'mariadb-server') {
+                $ver = @shell_exec("dpkg-query -W -f='\${Version}' 'mysql-server' 2>/dev/null");
+            }
+            if ((!$ver || trim($ver) === '') && str_starts_with($pkg, 'php')) {
+                $ver = @shell_exec("dpkg-query -W -f='\${Version}' 'php-common' 2>/dev/null");
+            }
             if ($ver && trim($ver) !== '') {
                 return trim($ver);
             }
@@ -977,23 +1114,24 @@ if (!function_exists('audit_service_cves')) {
             // Check if service or CVE has an applied patch/hardening receipt
             $isPatched = is_cve_patched($unit, $cveId, $normVer, $cve, $forceFresh);
 
-            // CRITICAL: A receipt can NEVER mask an actively vulnerable or downgraded installed version!
-            if ($isAffected) {
+            if ($isAffected && !$isPatched) {
                 $cve['status'] = 'pending';
                 $cve['patch_applied'] = false;
+                $cve['is_affected'] = true;
             } elseif ($isPatched) {
                 $cve['status'] = 'hardened';
                 $cve['patch_applied'] = true;
+                $cve['is_affected'] = false;
                 $cve['mitigation'] = ($cve['mitigation'] ?? '') . ' [Applied via 1-Click WTC Security Hardening]';
             } else {
                 $cve['status'] = 'clean';
                 $cve['patch_applied'] = false;
+                $cve['is_affected'] = false;
                 if (!empty($cve['affected_ranges'])) {
                     $cve['mitigation'] = ($cve['mitigation'] ?? '') . ' [Resolved in installed OS package release]';
                 }
             }
 
-            $cve['is_affected'] = $isAffected;
             $cve['installed_version'] = $normVer;
             $results[] = $cve;
         }

@@ -15,6 +15,8 @@ LOG_FILE="/var/log/wtc-web/network.log"
 PID_FILE="/run/wtc-network.pid"
 FAN_STATE_FILE="/run/wtc-fan-alert.state"
 PULSE_PID_FILE="/run/wtc-fan-pulse.pid"
+BOOT_STATE_FILE="/run/wtc-boot-loading.state"
+BOOT_PULSE_PID_FILE="/run/wtc-fan-boot-pulse.pid"
 STATUS_FILE="/run/wtc-network.status"
 WIFI_REASON=""
 RECONNECT_PID=""
@@ -132,6 +134,69 @@ start_fan_pulse() {
 fan_alert_is_active() {
   pulse_running && return 0
   [ -f "$FAN_STATE_FILE" ] && [ "$(cat "$FAN_STATE_FILE" 2>/dev/null)" = "1" ]
+}
+
+boot_pulse_running() {
+  local ppid
+  [ -f "$BOOT_PULSE_PID_FILE" ] || return 1
+  ppid="$(cat "$BOOT_PULSE_PID_FILE" 2>/dev/null || true)"
+  [ -n "$ppid" ] && kill -0 "$ppid" 2>/dev/null
+}
+
+boot_loading_is_active() {
+  [ -f "$BOOT_STATE_FILE" ] || return 1
+  local started now age
+  started="$(cat "$BOOT_STATE_FILE" 2>/dev/null || echo 0)"
+  now="$(date +%s 2>/dev/null || echo 0)"
+  if [[ "$started" =~ ^[0-9]+$ ]] && [[ "$now" =~ ^[0-9]+$ ]] && [ "$started" -gt 0 ]; then
+    age=$((now - started))
+    if [ "$age" -gt 180 ]; then
+      # Safety expiry if a boot loader crashed without calling boot-stop
+      rm -f "$BOOT_STATE_FILE"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+stop_boot_pulse() {
+  local ppid
+  if [ -f "$BOOT_PULSE_PID_FILE" ]; then
+    ppid="$(cat "$BOOT_PULSE_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$ppid" ]; then
+      pkill -P "$ppid" 2>/dev/null || true
+      kill "$ppid" 2>/dev/null || true
+    fi
+    rm -f "$BOOT_PULSE_PID_FILE"
+  fi
+  set_fan_state 0
+}
+
+# Distinct double-blip heartbeat (0.25s on, 0.2s off, 0.25s on, 1.3s off) for boot/service loading,
+# unmistakably different from the slow 1.5s/1.5s Wi-Fi disconnect pulse.
+start_boot_pulse() {
+  boot_pulse_running && return 0
+  # Ensure Wi-Fi pulse isn't fighting the GPIO/PWM pin at the same time
+  if pulse_running; then
+    local wpid
+    wpid="$(cat "$PULSE_PID_FILE" 2>/dev/null || true)"
+    [ -n "$wpid" ] && { pkill -P "$wpid" 2>/dev/null || true; kill "$wpid" 2>/dev/null || true; }
+    rm -f "$PULSE_PID_FILE"
+  fi
+  (
+    while true; do
+      set_fan_state 1
+      sleep 0.25
+      set_fan_state 0
+      sleep 0.2
+      set_fan_state 1
+      sleep 0.25
+      set_fan_state 0
+      sleep 1.3
+    done
+  ) >/dev/null 2>&1 &
+  echo "$!" > "$BOOT_PULSE_PID_FILE"
+  log "Boot-loading fan pulse started (double-blip heartbeat, PID: $!)"
 }
 
 # ------------------------------------------------------------ power save & auto-connect
@@ -258,7 +323,7 @@ run_daemon() {
   echo "$$" > "$PID_FILE"
   log "Starting WTC Network Watchdog (PID: $$)"
 
-  trap 'rm -f "$PID_FILE" "$STATUS_FILE"; stop_fan_pulse; log "Network watchdog stopped."; exit 0' INT TERM
+  trap 'rm -f "$PID_FILE" "$STATUS_FILE"; stop_boot_pulse; stop_fan_pulse; log "Network watchdog stopped."; exit 0' INT TERM
 
   disable_wifi_powersave
   configure_nm_autoconnect
@@ -273,6 +338,22 @@ run_daemon() {
     mode="${FAN_WIFI_MODE:-pulse}"
 
     disable_wifi_powersave
+
+    # While services/sites are loading into RAM on boot, keep the distinct boot heartbeat
+    # pulse running and skip Wi-Fi fan-off/fan-pulse overrides until boot loading completes.
+    if boot_loading_is_active; then
+      start_boot_pulse
+      if is_wifi_connected; then
+        echo "connected" > "$STATUS_FILE"
+      else
+        echo "disconnected: $WIFI_REASON" > "$STATUS_FILE"
+        reconnect_async
+      fi
+      sleep 2
+      continue
+    elif boot_pulse_running; then
+      stop_boot_pulse
+    fi
 
     if is_wifi_connected; then
       if [ "$last_state" != "connected" ]; then
@@ -347,9 +428,28 @@ cmd_check() {
 cmd_fan() {
   local act="${1:-status}" sec="${2:-5}"
   case "$act" in
-    on)    stop_fan_pulse; set_fan_state 1; echo "Fan turned ON" ;;
-    off)   stop_fan_pulse; echo "Fan turned OFF" ;;
-    pulse) start_fan_pulse; echo "Fan pulsing started" ;;
+    on)    stop_boot_pulse; stop_fan_pulse; set_fan_state 1; echo "Fan turned ON" ;;
+    off)   rm -f "$BOOT_STATE_FILE"; stop_boot_pulse; stop_fan_pulse; echo "Fan turned OFF" ;;
+    pulse) stop_boot_pulse; start_fan_pulse; echo "Fan pulsing started (Wi-Fi alert pattern)" ;;
+    boot-pulse) start_boot_pulse; echo "Boot-loading fan pulse started (double-blip heartbeat)" ;;
+    boot-start)
+      date +%s > "$BOOT_STATE_FILE"
+      start_boot_pulse
+      echo "Boot-loading fan pulse active"
+      ;;
+    boot-stop)
+      rm -f "$BOOT_STATE_FILE"
+      stop_boot_pulse
+      log "Boot-loading fan pulse stopped"
+      if [ "${FAN_ON_WIFI_DISCONNECT:-no}" = "yes" ] && ! is_wifi_connected; then
+        if [ "${FAN_WIFI_MODE:-pulse}" = "spin" ]; then
+          set_fan_state 1
+        else
+          start_fan_pulse
+        fi
+      fi
+      echo "Boot-loading fan pulse stopped"
+      ;;
     test)
       echo "Testing fan for $sec seconds..."
       if [ "${FAN_WIFI_MODE:-pulse}" = "spin" ]; then
@@ -359,8 +459,11 @@ cmd_fan() {
       fi
       echo "Fan test completed."
       ;;
-    status) echo "Fan alert active: $(fan_alert_is_active && echo YES || echo NO)" ;;
-    *) echo "Usage: wtc-network fan on|off|pulse|test [sec]|status" >&2; exit 2 ;;
+    status)
+      echo "Boot pulse active : $(boot_pulse_running && echo YES || echo NO)"
+      echo "Fan alert active  : $(fan_alert_is_active && echo YES || echo NO)"
+      ;;
+    *) echo "Usage: wtc-network fan on|off|pulse|boot-pulse|boot-start|boot-stop|test [sec]|status" >&2; exit 2 ;;
   esac
 }
 

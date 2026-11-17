@@ -2,7 +2,8 @@
 # 03-site-service.sh -> /usr/local/bin/wtc-site-service
 # Manages the RAM disk, swaps the live site, ingests dropbox archives, saves state.
 #
-#   --boot            mount RAM disk, load the active site (nginx not reloaded; it starts after us)
+#   --boot            mount RAM disk, sync Management UI first, start boot-loading fan pulse
+#   --boot-sites      transfer active site(s) from SD to RAM after UI/DB services are up, then stop boot pulse
 #   --swap <site>     make <site> live and reload nginx
 #   --reload          re-load the active site from its archive
 #   --ingest          process archives in the dropbox (new site / update existing)
@@ -136,20 +137,13 @@ if (file_exists(__DIR__ . '/public/index.php')) {
 }
 EOF
     fi
-    mkdir -p "$site_dir/storage/framework/cache/data" \
-             "$site_dir/storage/framework/sessions" \
-             "$site_dir/storage/framework/views" \
-             "$site_dir/storage/logs" \
-             "$site_dir/storage/app/public" \
-             "$site_dir/bootstrap/cache"
+    ensure_laravel_storage_link "$site_dir"
     if [ ! -f "$site_dir/.env" ] && [ -f "$site_dir/.env.example" ]; then
       cp -n "$site_dir/.env.example" "$site_dir/.env"
       db_write_files "$site" "$site_dir"
     fi
     rm -f "$site_dir/bootstrap/cache/"*.php 2>/dev/null || true
     if [ -f "$site_dir/artisan" ]; then
-      rm -f "$site_dir/public/storage" 2>/dev/null || true
-      su -s /bin/bash "$WEB_USER" -c "php '$site_dir/artisan' storage:link --force" >> /var/log/wtc-web/service.log 2>&1 || true
       su -s /bin/bash "$WEB_USER" -c "php '$site_dir/artisan' route:clear" >> /var/log/wtc-web/service.log 2>&1 || true
       su -s /bin/bash "$WEB_USER" -c "php '$site_dir/artisan' optimize:clear" >> /var/log/wtc-web/service.log 2>&1 || true
     fi
@@ -175,15 +169,34 @@ if ($prefix !== '' && str_starts_with($reqUri, $prefix)) {
 }
 $reqUri = '/' . ltrim((string)$reqUri, '/');
 
-$filePath = __DIR__ . $reqUri;
-if (!is_file($filePath) && is_file(__DIR__ . '/public' . $reqUri)) {
-    $filePath = __DIR__ . '/public' . $reqUri;
+// Security Defense: Canonicalize path and prevent directory traversal (CWE-22)
+$root = realpath(__DIR__) ?: __DIR__;
+$publicRoot = realpath(__DIR__ . '/public') ?: ($root . '/public');
+
+$candidate = $root . $reqUri;
+$resolvedPath = realpath($candidate);
+
+if (($resolvedPath === false || !is_file($resolvedPath)) && is_dir($publicRoot)) {
+    $candidate = $publicRoot . $reqUri;
+    $resolvedPath = realpath($candidate);
 }
 
-$ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest'], true);
+// Disallow traversal outside site root or public folder
+$isValidPath = false;
+if ($resolvedPath !== false && is_file($resolvedPath)) {
+    if (str_starts_with($resolvedPath, $root) || (is_dir($publicRoot) && str_starts_with($resolvedPath, $publicRoot))) {
+        // Reject hidden files, environment files, git, sqlite, and config files
+        $base = basename($resolvedPath);
+        if (!str_starts_with($base, '.') && !preg_match('/\.(env|git|htaccess|htpasswd|conf|ini|log|sqlite|sqlite3|db|sh|bak)$/i', $base)) {
+            $isValidPath = true;
+        }
+    }
+}
 
-if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) {
+$ext = $isValidPath ? strtolower(pathinfo($resolvedPath, PATHINFO_EXTENSION)) : '';
+$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest', 'txt', 'xml'], true);
+
+if ($isValidPath && $reqUri !== '/' && $isAsset && !str_ends_with($resolvedPath, '.php')) {
     $mimes = [
         'js' => 'application/javascript', 'mjs' => 'application/javascript',
         'css' => 'text/css', 'html' => 'text/html', 'htm' => 'text/html',
@@ -192,11 +205,12 @@ if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) 
         'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp',
         'ico' => 'image/x-icon', 'woff' => 'font/woff', 'woff2' => 'font/woff2',
         'ttf' => 'font/ttf', 'eot' => 'application/vnd.ms-fontobject',
-        'wasm' => 'application/wasm'
+        'wasm' => 'application/wasm', 'webmanifest' => 'application/manifest+json',
+        'txt' => 'text/plain', 'xml' => 'application/xml'
     ];
     $mime = $mimes[$ext] ?? 'application/octet-stream';
     header('Content-Type: ' . $mime);
-    readfile($filePath);
+    readfile($resolvedPath);
     exit;
 }
 
@@ -235,8 +249,26 @@ EOF
     webroot="$site_dir/public"
   fi
 
+  # Align .env for subpath or dedicated port hosting
+  local site_port
+  site_port="$(jq -r '.port // empty' "$SITES_DIR/$site.meta.json" 2>/dev/null || true)"
+  if [ "$make_primary" = "1" ] && [ -z "$site_port" ]; then
+    configure_site_env "$site_dir" "" "" "$site"
+  else
+    configure_site_env "$site_dir" "$slug" "$site_port" "$site"
+  fi
+  if [ ! -f "$site_dir/.env" ] && [ -f "$site_dir/artisan" ]; then
+    rebuild_laravel_ziggy "$site_dir" || true
+  fi
+
   # Generate dedicated Port 80 location blocks for /<slug>/
   generate_site_nginx_block "$site" "$slug" "$site_dir" "$webroot" "$RAM_NGINX_SITES/$slug.conf"
+
+  # Generate dedicated Port block if custom port is assigned in .meta.json
+  if [ -n "$site_port" ] && [ "$site_port" != "null" ]; then
+    generate_site_port_nginx_conf "$site" "$slug" "$site_port" "$webroot" "$RAM_NGINX_SITES/${slug}-port.conf"
+    ufw allow "$site_port/tcp" comment "Site $site Port" >/dev/null 2>&1 || true
+  fi
 
   # If this site should be the primary site (or no primary site exists)
   local cur_primary
@@ -258,7 +290,7 @@ EOF
       restart_nginx
     else
       log "nginx -t failed for '$site' - reverting. Details: $ng_err"
-      rm -f "$RAM_NGINX_SITES/$slug.conf"
+      rm -f "$RAM_NGINX_SITES/$slug.conf" "$RAM_NGINX_SITES/${slug}-port.conf"
       rm -rf "$site_dir"
       die "Activation of '$site' aborted: invalid nginx configuration"
     fi
@@ -280,7 +312,13 @@ deactivate_site() {
     save_state "$site" || log "Save-state before deactivation failed for '$site'"
   fi
 
-  rm -f "$RAM_NGINX_SITES/$slug.conf"
+  local site_port
+  site_port="$(jq -r '.port // empty' "$SITES_DIR/$site.meta.json" 2>/dev/null || true)"
+  if [ -n "$site_port" ] && [ "$site_port" != "null" ]; then
+    ufw delete allow "$site_port/tcp" >/dev/null 2>&1 || true
+  fi
+
+  rm -f "$RAM_NGINX_SITES/$slug.conf" "$RAM_NGINX_SITES/${slug}-port.conf"
   rm -rf "$site_dir"
   remove_active_site "$site"
 
@@ -319,95 +357,9 @@ swap_site() {
   activate_site "$site" 1
 }
 
-# Swap a staged directory in RAM directly into multi-site RAM host without tar/untar
-swap_dir() {
-  local site="$1" dir="$2" make_primary="${3:-}" slug site_dir webroot ng_err
-  valid_name "$site" || die "Invalid site name: $site"
-  [ -d "$dir" ] || die "Directory not found: $dir"
-  ensure_ramdisk
-
-  slug="$(site_slug "$site")"
-  [ -n "$slug" ] || slug="site"
-  site_dir="$RAM_SITES_DIR/$slug"
-  mkdir -p "$RAM_SITES_DIR"
-
-  log "Swapping staged directory into RAM disk at $site_dir (site: $site, slug: $slug)..."
-
-  local tmp_target="$RAM_SITES_DIR/.$slug.new.$$"
-  rm -rf "$tmp_target"
-  mkdir -p "$tmp_target"
-  cp -a "$dir"/. "$tmp_target"/
-  preserve_existing_site_configs "$site" "$tmp_target"
-
-  # Check if React build / dist folder is present and promote
-  for sub in dist build out; do
-    if [ -d "$tmp_target/$sub" ] && [ -f "$tmp_target/$sub/index.html" ]; then
-      cp -rn "$tmp_target/$sub"/* "$tmp_target"/ 2>/dev/null || true
-      break
-    fi
-  done
-
-  # If React/Node project with package.json build script and no built index.*, trigger background build
-  if [ -f "$tmp_target/package.json" ] && grep -q '"build"' "$tmp_target/package.json" 2>/dev/null; then
-    if [ ! -f "$tmp_target/index.html" ] && [ ! -f "$tmp_target/index.php" ]; then
-      log "Site '$site' contains package.json build script - triggering background build job"
-      /usr/local/bin/wtc-manage --build "$site" >/dev/null 2>&1 &
-    fi
-  fi
-
-  # Auto-create database & user if enabled, and inject connection helpers
-  db_ensure "$site" || log "Database ensure for '$site' failed or MariaDB not running"
-  db_write_files "$site" "$tmp_target"
-
-  # Restore database if snapshot exists in the staged directory
-  if db_available; then
-    local db_dump_file=""
-    if [ -f "$tmp_target/.wtc-database.sql" ]; then
-      db_dump_file="$tmp_target/.wtc-database.sql"
-    elif [ -f "$tmp_target/.wtc-db.sql" ]; then
-      db_dump_file="$tmp_target/.wtc-db.sql"
-    fi
-    if [ -n "$db_dump_file" ]; then
-      local db_id; db_id="$(db_ident "$site")"
-      log "Restoring database snapshot from $(basename "$db_dump_file") into '$db_id'..."
-      mariadb "$db_id" < "$db_dump_file" 2>/dev/null || log "Warning: Database restore into '$db_id' reported errors"
-    fi
-  fi
-
-  # Check if Laravel application
-  if [ -f "$tmp_target/artisan" ] || [ -f "$tmp_target/public/index.php" ]; then
-    log "Laravel application detected for '$site' - preparing webroot & permissions"
-    rm -f "$tmp_target/public/hot" 2>/dev/null || true
-    if [ ! -f "$tmp_target/index.php" ]; then
-      cat > "$tmp_target/index.php" <<'EOF'
-<?php
-// WTC Pi Laravel Gateway
-if (file_exists(__DIR__ . '/public/index.php')) {
-    require_once __DIR__ . '/public/index.php';
-}
-EOF
-    fi
-    mkdir -p "$tmp_target/storage/framework/cache/data" \
-             "$tmp_target/storage/framework/sessions" \
-             "$tmp_target/storage/framework/views" \
-             "$tmp_target/storage/logs" \
-             "$tmp_target/storage/app/public" \
-             "$tmp_target/bootstrap/cache"
-    rm -f "$tmp_target/bootstrap/cache/"*.php 2>/dev/null || true
-    if [ ! -f "$tmp_target/.env" ] && [ -f "$tmp_target/.env.example" ]; then
-      cp -n "$tmp_target/.env.example" "$tmp_target/.env"
-      db_write_files "$site" "$tmp_target"
-    fi
-    if [ -f "$tmp_target/artisan" ]; then
-      rm -f "$tmp_target/public/storage" 2>/dev/null || true
-      su -s /bin/bash "$WEB_USER" -c "php '$tmp_target/artisan' storage:link --force" >> /var/log/wtc-web/service.log 2>&1 || true
-      su -s /bin/bash "$WEB_USER" -c "php '$tmp_target/artisan' route:clear" >> /var/log/wtc-web/service.log 2>&1 || true
-      su -s /bin/bash "$WEB_USER" -c "php '$tmp_target/artisan' optimize:clear" >> /var/log/wtc-web/service.log 2>&1 || true
-    fi
-  fi
-
-  if [ ! -f "$tmp_target/index.php" ]; then
-    cat > "$tmp_target/index.php" <<'EOF'
+_write_spa_bridge_php() {
+  local target_file="$1"
+  cat > "$target_file" <<'EOF'
 <?php
 // WTC Pi SPA Router Bridge & Fallback Gateway
 $rawUri = $_SERVER['REQUEST_URI'] ?? '/';
@@ -426,15 +378,34 @@ if ($prefix !== '' && str_starts_with($reqUri, $prefix)) {
 }
 $reqUri = '/' . ltrim((string)$reqUri, '/');
 
-$filePath = __DIR__ . $reqUri;
-if (!is_file($filePath) && is_file(__DIR__ . '/public' . $reqUri)) {
-    $filePath = __DIR__ . '/public' . $reqUri;
+// Security Defense: Canonicalize path and prevent directory traversal (CWE-22)
+$root = realpath(__DIR__) ?: __DIR__;
+$publicRoot = realpath(__DIR__ . '/public') ?: ($root . '/public');
+
+$candidate = $root . $reqUri;
+$resolvedPath = realpath($candidate);
+
+if (($resolvedPath === false || !is_file($resolvedPath)) && is_dir($publicRoot)) {
+    $candidate = $publicRoot . $reqUri;
+    $resolvedPath = realpath($candidate);
 }
 
-$ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest'], true);
+// Disallow traversal outside site root or public folder
+$isValidPath = false;
+if ($resolvedPath !== false && is_file($resolvedPath)) {
+    if (str_starts_with($resolvedPath, $root) || (is_dir($publicRoot) && str_starts_with($resolvedPath, $publicRoot))) {
+        // Reject hidden files, environment files, git, sqlite, and config files
+        $base = basename($resolvedPath);
+        if (!str_starts_with($base, '.') && !preg_match('/\.(env|git|htaccess|htpasswd|conf|ini|log|sqlite|sqlite3|db|sh|bak)$/i', $base)) {
+            $isValidPath = true;
+        }
+    }
+}
 
-if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) {
+$ext = $isValidPath ? strtolower(pathinfo($resolvedPath, PATHINFO_EXTENSION)) : '';
+$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest', 'txt', 'xml'], true);
+
+if ($isValidPath && $reqUri !== '/' && $isAsset && !str_ends_with($resolvedPath, '.php')) {
     $mimes = [
         'js' => 'application/javascript', 'mjs' => 'application/javascript',
         'css' => 'text/css', 'html' => 'text/html', 'htm' => 'text/html',
@@ -443,11 +414,12 @@ if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) 
         'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp',
         'ico' => 'image/x-icon', 'woff' => 'font/woff', 'woff2' => 'font/woff2',
         'ttf' => 'font/ttf', 'eot' => 'application/vnd.ms-fontobject',
-        'wasm' => 'application/wasm'
+        'wasm' => 'application/wasm', 'webmanifest' => 'application/manifest+json',
+        'txt' => 'text/plain', 'xml' => 'application/xml'
     ];
     $mime = $mimes[$ext] ?? 'application/octet-stream';
     header('Content-Type: ' . $mime);
-    readfile($filePath);
+    readfile($resolvedPath);
     exit;
 }
 
@@ -476,17 +448,91 @@ if (is_file(__DIR__ . '/index.html')) {
 http_response_code(404);
 echo "404 Not Found";
 EOF
+}
+
+# Finalize site directory in RAM: permissions, DB, Laravel/SPA hooks, nginx routing, primary links.
+# Args: <site> <site_dir> <make_primary> [restore_db_sql:0|1] [promote_dist:0|1] [preserve_existing_on_nginx_err:0|1]
+_finalize_ram_site() {
+  local site="$1" site_dir="$2" make_primary="${3:-}" restore_db_sql="${4:-1}" promote_dist="${5:-1}" preserve_on_err="${6:-0}"
+  local slug webroot ng_err
+  slug="$(site_slug "$site")"
+  [ -n "$slug" ] || slug="site"
+
+  # Check if React build / dist folder is present and promote
+  if [ "$promote_dist" = "1" ]; then
+    local sub
+    for sub in dist build out; do
+      if [ -d "$site_dir/$sub" ] && [ -f "$site_dir/$sub/index.html" ]; then
+        cp -rn "$site_dir/$sub"/* "$site_dir"/ 2>/dev/null || true
+        break
+      fi
+    done
   fi
 
-  chown -R "$WEB_USER:$WEB_USER" "$tmp_target"
-  chmod -R u=rwX,go=rX "$tmp_target"
-  [ -d "$tmp_target/storage" ] && chmod -R 775 "$tmp_target/storage" "$tmp_target/bootstrap/cache" 2>/dev/null || true
+  # If React/Node project with package.json build script and no built index.*, trigger background build
+  if [ -f "$site_dir/package.json" ] && grep -q '"build"' "$site_dir/package.json" 2>/dev/null; then
+    if [ ! -f "$site_dir/index.html" ] && [ ! -f "$site_dir/index.php" ]; then
+      log "Site '$site' contains package.json build script - triggering background build job"
+      /usr/local/bin/wtc-manage --build "$site" >/dev/null 2>&1 &
+    fi
+  fi
 
-  # Replace site_dir atomically
-  local old_site_dir="$RAM_SITES_DIR/.$slug.old.$$"
-  [ -d "$site_dir" ] && mv "$site_dir" "$old_site_dir"
-  mv "$tmp_target" "$site_dir"
-  rm -rf "$old_site_dir" 2>/dev/null || true
+  # Auto-create database & user if enabled, and inject connection helpers
+  db_ensure "$site" || log "Database ensure for '$site' failed or MariaDB not running"
+  db_write_files "$site" "$site_dir"
+
+  # Restore database if snapshot exists and restore was requested
+  if [ "$restore_db_sql" = "1" ] && db_available; then
+    local db_dump_file=""
+    if [ -f "$site_dir/.wtc-database.sql" ]; then
+      db_dump_file="$site_dir/.wtc-database.sql"
+    elif [ -f "$site_dir/.wtc-db.sql" ]; then
+      db_dump_file="$site_dir/.wtc-db.sql"
+    fi
+    if [ -n "$db_dump_file" ]; then
+      local db_id; db_id="$(db_ident "$site")"
+      log "Restoring database snapshot from $(basename "$db_dump_file") into '$db_id'..."
+      mariadb "$db_id" < "$db_dump_file" 2>/dev/null || log "Warning: Database restore into '$db_id' reported errors"
+    fi
+  fi
+
+  # Check if Laravel application
+  if [ -f "$site_dir/artisan" ] || [ -f "$site_dir/public/index.php" ]; then
+    rm -f "$site_dir/public/hot" 2>/dev/null || true
+    if [ ! -f "$site_dir/index.php" ]; then
+      cat > "$site_dir/index.php" <<'EOF'
+<?php
+// WTC Pi Laravel Gateway
+if (file_exists(__DIR__ . '/public/index.php')) {
+    require_once __DIR__ . '/public/index.php';
+}
+EOF
+      chown "$WEB_USER:$WEB_USER" "$site_dir/index.php" 2>/dev/null || true
+    fi
+    ensure_laravel_storage_link "$site_dir"
+    rm -f "$site_dir/bootstrap/cache/"*.php 2>/dev/null || true
+    if [ ! -f "$site_dir/.env" ] && [ -f "$site_dir/.env.example" ]; then
+      cp -n "$site_dir/.env.example" "$site_dir/.env"
+      chown "$WEB_USER:$WEB_USER" "$site_dir/.env" 2>/dev/null || true
+      db_write_files "$site" "$site_dir"
+    fi
+  fi
+
+  if [ ! -f "$site_dir/index.php" ]; then
+    _write_spa_bridge_php "$site_dir/index.php"
+    chown "$WEB_USER:$WEB_USER" "$site_dir/index.php" 2>/dev/null || true
+  fi
+
+  local site_port
+  site_port="$(jq -r '.port // empty' "$SITES_DIR/$site.meta.json" 2>/dev/null || true)"
+  if [ "$make_primary" = "1" ] && [ -z "$site_port" ]; then
+    configure_site_env "$site_dir" "" "" "$site"
+  else
+    configure_site_env "$site_dir" "$slug" "$site_port" "$site"
+  fi
+  if [ ! -f "$site_dir/.env" ] && [ -f "$site_dir/artisan" ]; then
+    rebuild_laravel_ziggy "$site_dir" || true
+  fi
 
   webroot="$site_dir"
   if [ -d "$site_dir/public" ] && { [ -f "$site_dir/artisan" ] || [ -f "$site_dir/public/index.php" ]; }; then
@@ -495,6 +541,12 @@ EOF
 
   # Generate dedicated Port 80 location blocks for /<slug>/
   generate_site_nginx_block "$site" "$slug" "$site_dir" "$webroot" "$RAM_NGINX_SITES/$slug.conf"
+
+  # Generate dedicated Port block if custom port is assigned in .meta.json
+  if [ -n "$site_port" ] && [ "$site_port" != "null" ]; then
+    generate_site_port_nginx_conf "$site" "$slug" "$site_port" "$webroot" "$RAM_NGINX_SITES/${slug}-port.conf"
+    ufw allow "$site_port/tcp" comment "Site $site Port" >/dev/null 2>&1 || true
+  fi
 
   # If this site should be the primary site (or no primary site exists, or site was already primary)
   local cur_primary
@@ -516,27 +568,141 @@ EOF
     if ng_err="$(nginx -t 2>&1)"; then
       restart_nginx
     else
-      log "nginx -t failed for '$site' direct swap - reverting. Details: $ng_err"
-      rm -f "$RAM_NGINX_SITES/$slug.conf"
-      rm -rf "$site_dir"
+      log "nginx -t failed for '$site' - reverting config. Details: $ng_err"
+      rm -f "$RAM_NGINX_SITES/$slug.conf" "$RAM_NGINX_SITES/${slug}-port.conf"
+      if [ "$preserve_on_err" != "1" ]; then
+        rm -rf "$site_dir"
+      fi
       die "Swap of '$site' aborted: invalid nginx configuration"
     fi
   fi
 
   add_active_site "$site"
   date +%s > "$SAVE_STAMP"
-  log "Site '$site' is now live at /$slug/ and active in RAM (direct swap)"
-  if [ -x /usr/local/bin/wtc-workers ]; then
-    /usr/local/bin/wtc-workers restart >> /var/log/wtc-web/service.log 2>&1 || true
+  if [ -x /usr/local/bin/wtc-workers ] && [ -f "$site_dir/artisan" ]; then
+    ( /usr/local/bin/wtc-workers restart >> /var/log/wtc-web/service.log 2>&1 || true ) &
   fi
+}
+
+# Replace/overlay uploaded files directly in RAM ($RAM_SITES_DIR/$slug) without SD staging
+# or full-directory doubling, for instant access to the live site.
+ram_replace() {
+  local site="$1" dir="$2" make_primary="${3:-}" slug site_dir had_live=0
+  valid_name "$site" || die "Invalid site name: $site"
+  [ -d "$dir" ] || die "Directory not found: $dir"
+  ensure_ramdisk
+
+  slug="$(site_slug "$site")"
+  [ -n "$slug" ] || slug="site"
+  site_dir="$RAM_SITES_DIR/$slug"
+  mkdir -p "$RAM_SITES_DIR"
+
+  if [ -d "$site_dir" ] && [ -n "$(ls -A "$site_dir" 2>/dev/null)" ]; then
+    had_live=1
+  elif [ -f "$SITES_DIR/$site.tar.gz" ]; then
+    # Site is not yet in RAM: if upload has no root entrypoint, unpack SD catalog into RAM first
+    if [ ! -f "$dir/index.php" ] && [ ! -f "$dir/index.html" ] && [ ! -f "$dir/public/index.php" ] && [ ! -f "$dir/artisan" ]; then
+      log "Loading existing catalog for '$site' into RAM before applying uploaded files..."
+      mkdir -p "$site_dir"
+      safe_extract_archive "$SITES_DIR/$site.tar.gz" "$site_dir" || { rm -rf "$site_dir"; die "Failed to unpack $site into RAM"; }
+      chown -R "$WEB_USER:$WEB_USER" "$site_dir"
+      chmod -R u=rwX,go=rX "$site_dir"
+      had_live=1
+    fi
+  fi
+
+  local restore_db=0 promote_dist=0
+  if [ -f "$dir/.wtc-database.sql" ] || [ -f "$dir/.wtc-db.sql" ]; then
+    restore_db=1
+  fi
+  if [ -f "$dir/dist/index.html" ] || [ -f "$dir/build/index.html" ] || [ -f "$dir/out/index.html" ]; then
+    promote_dist=1
+  fi
+
+  if [ "$had_live" -eq 1 ]; then
+    log "Replacing uploaded files directly in RAM at $site_dir (site: $site, slug: $slug)..."
+    protect_ram_overlay "$site" "$dir" "$site_dir"
+    # Check again after protection (in case .wtc-database.sql was protected/removed)
+    restore_db=0
+    if [ -f "$dir/.wtc-database.sql" ] || [ -f "$dir/.wtc-db.sql" ]; then
+      restore_db=1
+    fi
+    chown -R "$WEB_USER:$WEB_USER" "$dir"
+    chmod -R u=rwX,go=rX "$dir"
+    cp -a "$dir"/. "$site_dir"/
+    [ -d "$dir/storage" ] && [ -d "$site_dir/storage" ] && chmod -R 775 "$site_dir/storage" 2>/dev/null || true
+    [ -d "$dir/bootstrap/cache" ] && [ -d "$site_dir/bootstrap/cache" ] && chmod -R 775 "$site_dir/bootstrap/cache" 2>/dev/null || true
+    _finalize_ram_site "$site" "$site_dir" "$make_primary" "$restore_db" "$promote_dist" "1"
+    log "Site '$site' files replaced directly in RAM and live at /$slug/"
+  else
+    log "Deploying '$site' directly into RAM at $site_dir..."
+    mkdir -p "$site_dir"
+    preserve_existing_site_configs "$site" "$dir"
+    chown -R "$WEB_USER:$WEB_USER" "$dir"
+    chmod -R u=rwX,go=rX "$dir"
+    cp -a "$dir"/. "$site_dir"/
+    [ -d "$site_dir/storage" ] && chmod -R 775 "$site_dir/storage" "$site_dir/bootstrap/cache" 2>/dev/null || true
+    _finalize_ram_site "$site" "$site_dir" "$make_primary" "1" "1" "0"
+    log "Site '$site' is now live at /$slug/ and active in RAM"
+  fi
+}
+
+# Swap a staged directory in RAM directly into multi-site RAM host without tar/untar
+swap_dir() {
+  local site="$1" dir="$2" make_primary="${3:-}" slug site_dir
+  valid_name "$site" || die "Invalid site name: $site"
+  [ -d "$dir" ] || die "Directory not found: $dir"
+  ensure_ramdisk
+
+  slug="$(site_slug "$site")"
+  [ -n "$slug" ] || slug="site"
+  site_dir="$RAM_SITES_DIR/$slug"
+  mkdir -p "$RAM_SITES_DIR"
+
+  log "Swapping staged directory into RAM disk at $site_dir (site: $site, slug: $slug)..."
+
+  local tmp_target="$RAM_SITES_DIR/.$slug.new.$$"
+  rm -rf "$tmp_target"
+  mkdir -p "$tmp_target"
+  cp -a "$dir"/. "$tmp_target"/
+  preserve_existing_site_configs "$site" "$tmp_target"
+
+  chown -R "$WEB_USER:$WEB_USER" "$tmp_target"
+  chmod -R u=rwX,go=rX "$tmp_target"
+  [ -d "$tmp_target/storage" ] && chmod -R 775 "$tmp_target/storage" "$tmp_target/bootstrap/cache" 2>/dev/null || true
+
+  # Replace site_dir atomically
+  local old_site_dir="$RAM_SITES_DIR/.$slug.old.$$"
+  [ -d "$site_dir" ] && mv "$site_dir" "$old_site_dir"
+  mv "$tmp_target" "$site_dir"
+  rm -rf "$old_site_dir" 2>/dev/null || true
+  ensure_laravel_storage_link "$site_dir"
+
+  _finalize_ram_site "$site" "$site_dir" "$make_primary" "1" "1" "0"
+  log "Site '$site' is now live at /$slug/ and active in RAM (direct swap)"
 }
 
 boot() {
   ensure_ramdisk
   reload_ui_ram
 
-  # On boot: clean up any stale nginx-sites snippets so only primary is loaded
+  # Signal the distinct boot-loading fan pulse immediately while services & sites come up
+  [ -x /usr/local/bin/wtc-network ] && /usr/local/bin/wtc-network fan boot-start >/dev/null 2>&1 || true
+
+  # Clean up stale nginx-sites snippets and prepare a fast placeholder webroot so
+  # php-fpm and nginx can start immediately and serve the Management UI on port 4485
+  # before heavy SD-to-RAM site extraction begins.
   rm -f "$RAM_NGINX_SITES"/*.conf 2>/dev/null || true
+  generate_stack_nginx_conf "php" "" "$RAM_NGINX_CONF"
+  ln -sfn "$RAM_NGINX_CONF" "$NGINX_SNIPPET" 2>/dev/null || true
+  placeholder_site
+  log "Boot phase 1 complete: RAM disk ready and Management UI synced"
+}
+
+boot_sites() {
+  ensure_ramdisk
+  [ -x /usr/local/bin/wtc-network ] && /usr/local/bin/wtc-network fan boot-start >/dev/null 2>&1 || true
+  trap '[ -x /usr/local/bin/wtc-network ] && /usr/local/bin/wtc-network fan boot-stop >/dev/null 2>&1 || true' EXIT
 
   local primary
   primary="$(active_site)"
@@ -545,17 +711,14 @@ boot() {
   fi
 
   if [ -n "$primary" ] && [ -f "$SITES_DIR/$primary.tar.gz" ]; then
-    log "Booting UI and primary site: '$primary'"
+    log "Boot phase 2: transferring primary site '$primary' from SD to RAM..."
     mkdir -p "$(dirname "$ACTIVE_SITES_FILE")"
     echo "$primary" > "$ACTIVE_SITES_FILE"
     echo "$primary" > "$STATE_FILE"
-    NO_RELOAD=1 activate_site "$primary" 1 || log "Boot activation for primary site '$primary' failed"
+    activate_site "$primary" 1 || log "Boot activation for primary site '$primary' failed"
   else
-    log "No sites available on boot - serving placeholder"
+    log "No sites available on boot - keeping placeholder"
     rm -f "$ACTIVE_SITES_FILE" 2>/dev/null || true
-    generate_stack_nginx_conf "php" "" "$RAM_NGINX_CONF"
-    ln -sfn "$RAM_NGINX_CONF" "$NGINX_SNIPPET" 2>/dev/null || true
-    placeholder_site
   fi
 }
 
@@ -769,11 +932,8 @@ return new class {
 EOF
     fi
 
-    # Ensure storage skeleton exists
-    if [ ! -d "$extracted/storage" ]; then
-      mkdir -p "$extracted/storage/framework/views" "$extracted/storage/framework/sessions" \
-               "$extracted/storage/framework/cache" "$extracted/storage/logs" "$extracted/bootstrap/cache"
-    fi
+    # Ensure Laravel storage skeleton & public link exists
+    ensure_laravel_storage_link "$extracted"
   fi
 
   # Check if React build / dist folder is present and promote
@@ -806,15 +966,34 @@ if ($prefix !== '' && str_starts_with($reqUri, $prefix)) {
 }
 $reqUri = '/' . ltrim((string)$reqUri, '/');
 
-$filePath = __DIR__ . $reqUri;
-if (!is_file($filePath) && is_file(__DIR__ . '/public' . $reqUri)) {
-    $filePath = __DIR__ . '/public' . $reqUri;
+// Security Defense: Canonicalize path and prevent directory traversal (CWE-22)
+$root = realpath(__DIR__) ?: __DIR__;
+$publicRoot = realpath(__DIR__ . '/public') ?: ($root . '/public');
+
+$candidate = $root . $reqUri;
+$resolvedPath = realpath($candidate);
+
+if (($resolvedPath === false || !is_file($resolvedPath)) && is_dir($publicRoot)) {
+    $candidate = $publicRoot . $reqUri;
+    $resolvedPath = realpath($candidate);
 }
 
-$ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest'], true);
+// Disallow traversal outside site root or public folder
+$isValidPath = false;
+if ($resolvedPath !== false && is_file($resolvedPath)) {
+    if (str_starts_with($resolvedPath, $root) || (is_dir($publicRoot) && str_starts_with($resolvedPath, $publicRoot))) {
+        // Reject hidden files, environment files, git, sqlite, and config files
+        $base = basename($resolvedPath);
+        if (!str_starts_with($base, '.') && !preg_match('/\.(env|git|htaccess|htpasswd|conf|ini|log|sqlite|sqlite3|db|sh|bak)$/i', $base)) {
+            $isValidPath = true;
+        }
+    }
+}
 
-if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) {
+$ext = $isValidPath ? strtolower(pathinfo($resolvedPath, PATHINFO_EXTENSION)) : '';
+$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest', 'txt', 'xml'], true);
+
+if ($isValidPath && $reqUri !== '/' && $isAsset && !str_ends_with($resolvedPath, '.php')) {
     $mimes = [
         'js' => 'application/javascript', 'mjs' => 'application/javascript',
         'css' => 'text/css', 'html' => 'text/html', 'htm' => 'text/html',
@@ -823,11 +1002,12 @@ if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) 
         'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp',
         'ico' => 'image/x-icon', 'woff' => 'font/woff', 'woff2' => 'font/woff2',
         'ttf' => 'font/ttf', 'eot' => 'application/vnd.ms-fontobject',
-        'wasm' => 'application/wasm'
+        'wasm' => 'application/wasm', 'webmanifest' => 'application/manifest+json',
+        'txt' => 'text/plain', 'xml' => 'application/xml'
     ];
     $mime = $mimes[$ext] ?? 'application/octet-stream';
     header('Content-Type: ' . $mime);
-    readfile($filePath);
+    readfile($resolvedPath);
     exit;
 }
 
@@ -867,10 +1047,8 @@ EOF
     rm -rf "$tmp"; reject "$f" "No index.* file found at the site root"; return
   fi
 
-  if ! store_dir_as_site "$name" "$extracted"; then
-    rm -rf "$tmp"; reject "$f" "Failed to repack"; return
-  fi
-  rm -rf "$tmp"
+  local had_site=0
+  [ -f "$SITES_DIR/$name.tar.gz" ] && had_site=1
 
   if [ "$KEEP_PROCESSED" = yes ]; then
     mkdir -p "$PROCESSED_DIR"
@@ -881,19 +1059,25 @@ EOF
     rm -f "$f"
   fi
 
-  if [ "$EXISTED" -eq 1 ]; then
-    log "UPDATED site '$name' from $base"
-    if [ "$AUTO_RELOAD_ACTIVE" = yes ] && is_site_active "$name"; then
-      local is_prim=0; [ "$(active_site)" = "$name" ] && is_prim=1
-      "$SERVICE_BIN" --activate "$name" "$is_prim" || log "Hot reload of '$name' failed"
-    fi
+  if [ "$had_site" -eq 1 ] && [ "$AUTO_RELOAD_ACTIVE" = yes ] && is_site_active "$name"; then
+    local is_prim=0; [ "$(active_site)" = "$name" ] && is_prim=1
+    ram_replace "$name" "$extracted" "$is_prim" || log "Hot RAM replace of '$name' failed"
+    rm -rf "$tmp"
+    /usr/local/bin/wtc-manage --rebuild-catalog "$name" >/dev/null 2>&1 || true
+    log "UPDATED site '$name' in RAM from $base (SD catalog rebuilding)"
+  elif [ "$had_site" -eq 0 ] && [ "$AUTO_ACTIVATE_NEW" = yes ]; then
+    local cur_p; cur_p="$(active_site)"
+    local make_p=1; [ -n "$cur_p" ] && [ "$cur_p" != "$name" ] && make_p=0
+    ram_replace "$name" "$extracted" "$make_p" || log "Auto-activate of '$name' failed"
+    rm -rf "$tmp"
+    /usr/local/bin/wtc-manage --rebuild-catalog "$name" >/dev/null 2>&1 || true
+    log "NEW site '$name' deployed in RAM from $base (SD catalog rebuilding)"
   else
-    log "NEW site '$name' from $base"
-    if [ "$AUTO_ACTIVATE_NEW" = yes ]; then
-      local cur_p; cur_p="$(active_site)"
-      local make_p=1; [ -n "$cur_p" ] && [ "$cur_p" != "$name" ] && make_p=0
-      "$SERVICE_BIN" --activate "$name" "$make_p" || log "Auto-activate of '$name' failed"
+    if ! store_dir_as_site "$name" "$extracted"; then
+      rm -rf "$tmp"; reject "$f" "Failed to repack"; return
     fi
+    rm -rf "$tmp"
+    log "$([ "$had_site" -eq 1 ] && echo UPDATED || echo NEW) site '$name' from $base"
   fi
 }
 
@@ -994,11 +1178,8 @@ return new class {
 EOF
     fi
 
-    # Ensure storage skeleton exists
-    if [ ! -d "$extracted/storage" ]; then
-      mkdir -p "$extracted/storage/framework/views" "$extracted/storage/framework/sessions" \
-               "$extracted/storage/framework/cache" "$extracted/storage/logs" "$extracted/bootstrap/cache"
-    fi
+    # Ensure Laravel storage skeleton & public link exists
+    ensure_laravel_storage_link "$extracted"
   fi
 
   # Check if React build / dist folder is present and promote
@@ -1031,15 +1212,34 @@ if ($prefix !== '' && str_starts_with($reqUri, $prefix)) {
 }
 $reqUri = '/' . ltrim((string)$reqUri, '/');
 
-$filePath = __DIR__ . $reqUri;
-if (!is_file($filePath) && is_file(__DIR__ . '/public' . $reqUri)) {
-    $filePath = __DIR__ . '/public' . $reqUri;
+// Security Defense: Canonicalize path and prevent directory traversal (CWE-22)
+$root = realpath(__DIR__) ?: __DIR__;
+$publicRoot = realpath(__DIR__ . '/public') ?: ($root . '/public');
+
+$candidate = $root . $reqUri;
+$resolvedPath = realpath($candidate);
+
+if (($resolvedPath === false || !is_file($resolvedPath)) && is_dir($publicRoot)) {
+    $candidate = $publicRoot . $reqUri;
+    $resolvedPath = realpath($candidate);
 }
 
-$ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest'], true);
+// Disallow traversal outside site root or public folder
+$isValidPath = false;
+if ($resolvedPath !== false && is_file($resolvedPath)) {
+    if (str_starts_with($resolvedPath, $root) || (is_dir($publicRoot) && str_starts_with($resolvedPath, $publicRoot))) {
+        // Reject hidden files, environment files, git, sqlite, and config files
+        $base = basename($resolvedPath);
+        if (!str_starts_with($base, '.') && !preg_match('/\.(env|git|htaccess|htpasswd|conf|ini|log|sqlite|sqlite3|db|sh|bak)$/i', $base)) {
+            $isValidPath = true;
+        }
+    }
+}
 
-if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) {
+$ext = $isValidPath ? strtolower(pathinfo($resolvedPath, PATHINFO_EXTENSION)) : '';
+$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest', 'txt', 'xml'], true);
+
+if ($isValidPath && $reqUri !== '/' && $isAsset && !str_ends_with($resolvedPath, '.php')) {
     $mimes = [
         'js' => 'application/javascript', 'mjs' => 'application/javascript',
         'css' => 'text/css', 'html' => 'text/html', 'htm' => 'text/html',
@@ -1048,11 +1248,12 @@ if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) 
         'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp',
         'ico' => 'image/x-icon', 'woff' => 'font/woff', 'woff2' => 'font/woff2',
         'ttf' => 'font/ttf', 'eot' => 'application/vnd.ms-fontobject',
-        'wasm' => 'application/wasm'
+        'wasm' => 'application/wasm', 'webmanifest' => 'application/manifest+json',
+        'txt' => 'text/plain', 'xml' => 'application/xml'
     ];
     $mime = $mimes[$ext] ?? 'application/octet-stream';
     header('Content-Type: ' . $mime);
-    readfile($filePath);
+    readfile($resolvedPath);
     exit;
 }
 
@@ -1096,26 +1297,28 @@ EOF
 EOF
   fi
 
-  if ! store_dir_as_site "$name" "$extracted"; then
-    reject "$dir" "Failed to package folder into site"; return
-  fi
+  local had_site=0
+  [ -f "$SITES_DIR/$name.tar.gz" ] && had_site=1
 
-  rm -rf "$dir"
-  log "Packaged dropped folder '$base' into site '$name'"
-
-  if [ "$EXISTED" -eq 1 ]; then
-    log "UPDATED site '$name' from folder $base"
-    if [ "$AUTO_RELOAD_ACTIVE" = yes ] && is_site_active "$name"; then
-      local is_prim=0; [ "$(active_site)" = "$name" ] && is_prim=1
-      "$SERVICE_BIN" --activate "$name" "$is_prim" || log "Hot reload of '$name' failed"
-    fi
+  if [ "$had_site" -eq 1 ] && [ "$AUTO_RELOAD_ACTIVE" = yes ] && is_site_active "$name"; then
+    local is_prim=0; [ "$(active_site)" = "$name" ] && is_prim=1
+    ram_replace "$name" "$extracted" "$is_prim" || log "Hot RAM replace of '$name' failed"
+    rm -rf "$dir"
+    /usr/local/bin/wtc-manage --rebuild-catalog "$name" >/dev/null 2>&1 || true
+    log "UPDATED site '$name' in RAM from folder $base (SD catalog rebuilding)"
+  elif [ "$had_site" -eq 0 ] && [ "$AUTO_ACTIVATE_NEW" = yes ]; then
+    local cur_p; cur_p="$(active_site)"
+    local make_p=1; [ -n "$cur_p" ] && [ "$cur_p" != "$name" ] && make_p=0
+    ram_replace "$name" "$extracted" "$make_p" || log "Auto-spin-up of '$name' failed"
+    rm -rf "$dir"
+    /usr/local/bin/wtc-manage --rebuild-catalog "$name" >/dev/null 2>&1 || true
+    log "NEW site '$name' deployed in RAM from folder $base (SD catalog rebuilding)"
   else
-    log "NEW site '$name' from folder $base - auto-spinning up live"
-    if [ "$AUTO_ACTIVATE_NEW" = yes ]; then
-      local cur_p; cur_p="$(active_site)"
-      local make_p=1; [ -n "$cur_p" ] && [ "$cur_p" != "$name" ] && make_p=0
-      "$SERVICE_BIN" --activate "$name" "$make_p" || log "Auto-spin-up of '$name' failed"
+    if ! store_dir_as_site "$name" "$extracted"; then
+      reject "$dir" "Failed to package folder into site"; return
     fi
+    rm -rf "$dir"
+    log "Packaged dropped folder '$base' into site '$name'"
   fi
 }
 
@@ -1150,17 +1353,19 @@ main() {
   acquire_lock
   case "${1:-}" in
     --boot)       boot ;;
+    --boot-sites) boot_sites ;;
     --reload-ui)  reload_ui_ram ;;
     --activate|--enable-site) [ -n "${2:-}" ] || die "Usage: $0 --activate <site> [primary:0|1]"; activate_site "$2" "${3:-1}" ;;
     --deactivate|--disable-site) [ -n "${2:-}" ] || die "Usage: $0 --deactivate <site>"; deactivate_site "$2" ;;
     --swap)       [ -n "${2:-}" ] || die "Usage: $0 --swap <site>"; swap_site "$2" ;;
     --swap-dir)   [ -n "${2:-}" ] && [ -n "${3:-}" ] || die "Usage: $0 --swap-dir <site> <dir> [primary:0|1]"; swap_dir "$2" "$3" "${4:-}" ;;
+    --ram-replace) [ -n "${2:-}" ] && [ -n "${3:-}" ] || die "Usage: $0 --ram-replace <site> <dir> [primary:0|1]"; ram_replace "$2" "$3" "${4:-}" ;;
     --reload)     swap_site "$(active_site)" ;;
     --ingest)     ingest ;;
     --save-state) save_state "${2:-}" ;;
     --save-tick)  save_tick ;;
     --shutdown)   [ "$SAVE_ON_SHUTDOWN" = yes ] && save_state || true; [ -x /usr/local/bin/wtc-workers ] && /usr/local/bin/wtc-workers stop || true ;;
-    *) echo "Usage: $0 --boot|--reload-ui|--activate S [P]|--deactivate S|--swap S|--swap-dir S D [P]|--reload|--ingest|--save-state [S]|--save-tick|--shutdown" >&2; exit 2 ;;
+    *) echo "Usage: $0 --boot|--boot-sites|--reload-ui|--activate S [P]|--deactivate S|--swap S|--swap-dir S D [P]|--ram-replace S D [P]|--reload|--ingest|--save-state [S]|--save-tick|--shutdown" >&2; exit 2 ;;
   esac
 }
 main "$@"

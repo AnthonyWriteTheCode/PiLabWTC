@@ -267,15 +267,15 @@ listen.group = www-data
 pm = static
 pm.max_children = 1
 php_admin_value[session.save_path] = /mnt/ramdisk/php-tmp
-php_admin_value[upload_tmp_dir] = /mnt/ramdisk/php-tmp
-php_admin_value[upload_max_filesize] = 1024M
-php_admin_value[post_max_size] = 1024M
-php_admin_value[max_execution_time] = 600
-php_admin_value[max_input_time] = 600
-php_admin_value[memory_limit] = 512M
-php_admin_value[max_file_uploads] = 10000
+php_admin_value[upload_tmp_dir] = /var/tmp
+php_admin_value[upload_max_filesize] = 10240M
+php_admin_value[post_max_size] = 10240M
+php_admin_value[max_execution_time] = 3600
+php_admin_value[max_input_time] = 3600
+php_admin_value[memory_limit] = 2048M
+php_admin_value[max_file_uploads] = 50000
 php_admin_value[max_input_vars] = 50000
-php_admin_value[open_basedir] = /opt/wtc-web:/mnt/ramdisk:/var/lib/wtc-web:/etc/wtc-web:/etc/nginx:/etc/php:/etc/os-release:/tmp
+php_admin_value[open_basedir] = /opt/wtc-web:/mnt/ramdisk:/var/lib/wtc-web:/etc/wtc-web:/etc/nginx:/etc/php:/etc/ssl/wtc-ui:/etc/os-release:/tmp:/var/tmp
 EOF
 
 # 2. Live Site Pool: Dedicated multi-worker processes for served websites
@@ -292,13 +292,13 @@ pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 3
 php_admin_value[session.save_path] = /mnt/ramdisk/php-tmp
-php_admin_value[upload_tmp_dir] = /mnt/ramdisk/php-tmp
-php_admin_value[upload_max_filesize] = 1024M
-php_admin_value[post_max_size] = 1024M
-php_admin_value[max_execution_time] = 600
-php_admin_value[max_input_time] = 600
-php_admin_value[memory_limit] = 512M
-php_admin_value[max_file_uploads] = 10000
+php_admin_value[upload_tmp_dir] = /var/tmp
+php_admin_value[upload_max_filesize] = 10240M
+php_admin_value[post_max_size] = 10240M
+php_admin_value[max_execution_time] = 3600
+php_admin_value[max_input_time] = 3600
+php_admin_value[memory_limit] = 2048M
+php_admin_value[max_file_uploads] = 50000
 php_admin_value[max_input_vars] = 50000
 EOF
 
@@ -307,14 +307,14 @@ EOF
 
 # Site pool: keep uploads/sessions of served sites in RAM too, with OPcache on.
 cat > "/etc/php/$PHPV/fpm/conf.d/90-wtc.ini" <<'EOF'
-upload_tmp_dir = /mnt/ramdisk/php-tmp
+upload_tmp_dir = /var/tmp
 session.save_path = /mnt/ramdisk/php-tmp
-upload_max_filesize = 1024M
-post_max_size = 1024M
-max_execution_time = 600
-max_input_time = 600
-memory_limit = 512M
-max_file_uploads = 10000
+upload_max_filesize = 10240M
+post_max_size = 10240M
+max_execution_time = 3600
+max_input_time = 3600
+memory_limit = 2048M
+max_file_uploads = 50000
 max_input_vars = 50000
 opcache.enable = 1
 opcache.memory_consumption = 64
@@ -363,21 +363,32 @@ location / {
 EOF
 chmod 0644 /mnt/ramdisk/nginx.conf
 ln -sfn /mnt/ramdisk/nginx.conf /etc/nginx/wtc-site.conf
+cat > /etc/nginx/wtc-force-https.conf <<'EOF'
+# Force HTTPS disabled
+EOF
+chmod 0644 /etc/nginx/wtc-force-https.conf
+
 cat > /etc/nginx/sites-available/wtc <<'EOF'
-# Primary Live Site Web Server (Port 80 & 8080)
+# Primary Live Site Web Server (Port 80, 8080 & 443 HTTPS)
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     listen 8080;
     listen [::]:8080;
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    ssl_certificate /etc/ssl/wtc-ui/wtc-ui.crt;
+    ssl_certificate_key /etc/ssl/wtc-ui/wtc-ui.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
     server_name _;
+    include /etc/nginx/wtc-force-https.conf;
     root /mnt/ramdisk/webroot;
     index index.php index.html index.htm;
 
-    client_max_body_size 1024m;
-    client_body_temp_path /mnt/ramdisk/php-tmp/nginx-body 1 2;
-    client_body_timeout 600s;
-    send_timeout 600s;
+    client_max_body_size 10240m;
+    client_body_temp_path /var/tmp/nginx-body 1 2;
+    client_body_timeout 3600s;
+    send_timeout 3600s;
 
     include /etc/nginx/mime.types;
     types {
@@ -397,11 +408,17 @@ server {
     }
     default_type application/octet-stream;
 
-    # Clean redirect to dedicated Management UI on Port 4485
+    # Clean redirect to dedicated Management UI on Port 4485 (or 4486 over HTTPS)
     location = /manage {
+        if ($scheme = https) {
+            return 302 https://$host:4486/;
+        }
         return 302 http://$host:4485/;
     }
     location = /manage/ {
+        if ($scheme = https) {
+            return 302 https://$host:4486/;
+        }
         return 302 http://$host:4485/;
     }
 
@@ -430,13 +447,36 @@ server {
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
         fastcgi_param DOCUMENT_ROOT $realpath_root;
+        fastcgi_param HTTP_X_FORWARDED_PROTO $scheme;
+        fastcgi_param HTTP_X_FORWARDED_HOST $http_host;
         fastcgi_pass unix:/run/php/wtc-site.sock;
-        fastcgi_connect_timeout 600s;
-        fastcgi_read_timeout 600s;
-        fastcgi_send_timeout 600s;
+        fastcgi_connect_timeout 3600s;
+        fastcgi_read_timeout 3600s;
+        fastcgi_send_timeout 3600s;
     }
 }
 EOF
+# Self-signed TLS certificate for Management UI HTTPS (port 4486) so browser File System Access API works on pilabwtc.local
+UI_SSL_DIR="/etc/ssl/wtc-ui"
+if [ ! -f "$UI_SSL_DIR/wtc-ui.crt" ] || [ ! -f "$UI_SSL_DIR/wtc-ui.key" ]; then
+  mkdir -p "$UI_SSL_DIR"
+  HOST_NOW="$(hostname -s 2>/dev/null || echo pilabwtc)"
+  IP_NOW="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  SAN_LIST="DNS:pilabwtc.local,DNS:${HOST_NOW}.local,DNS:localhost,IP:127.0.0.1"
+  [ -n "$IP_NOW" ] && SAN_LIST="${SAN_LIST},IP:${IP_NOW}"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -keyout "$UI_SSL_DIR/wtc-ui.key" \
+    -out "$UI_SSL_DIR/wtc-ui.crt" \
+    -subj "/CN=pilabwtc.local/O=WTC piLab/C=US" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign,digitalSignature,keyEncipherment" \
+    -addext "subjectAltName=${SAN_LIST}" >/dev/null 2>&1 || true
+  chmod 600 "$UI_SSL_DIR/wtc-ui.key" 2>/dev/null || true
+  chmod 644 "$UI_SSL_DIR/wtc-ui.crt" 2>/dev/null || true
+fi
+mkdir -p /etc/wtc-web
+[ -f "$UI_SSL_DIR/wtc-ui.crt" ] && cp -f "$UI_SSL_DIR/wtc-ui.crt" /etc/wtc-web/wtc-ui.crt && chmod 644 /etc/wtc-web/wtc-ui.crt || true
+
 cat > /etc/nginx/sites-available/wtc-ui <<EOF
 # Management UI (Dedicated Port $UI_PORT - Single Worker)
 server {
@@ -444,10 +484,10 @@ server {
     listen [::]:$UI_PORT;
     server_name _;
     root /mnt/ramdisk/ui;
-    client_max_body_size 1024m;
-    client_body_temp_path /mnt/ramdisk/php-tmp/nginx-body 1 2;
-    client_body_timeout 600s;
-    send_timeout 600s;
+    client_max_body_size 10240m;
+    client_body_temp_path /var/tmp/nginx-body 1 2;
+    client_body_timeout 3600s;
+    send_timeout 3600s;
     index index.php index.html;
 
     include /etc/nginx/mime.types;
@@ -478,9 +518,58 @@ server {
         fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
         fastcgi_param DOCUMENT_ROOT \$realpath_root;
         fastcgi_pass unix:/run/php/wtc-ui.sock;
-        fastcgi_connect_timeout 600s;
-        fastcgi_read_timeout 600s;
-        fastcgi_send_timeout 600s;
+        fastcgi_connect_timeout 3600s;
+        fastcgi_read_timeout 3600s;
+        fastcgi_send_timeout 3600s;
+    }
+}
+
+# Management UI HTTPS (Port 4486 - Self-Signed for pilabwtc.local)
+server {
+    listen 4486 ssl;
+    listen [::]:4486 ssl;
+    server_name _;
+    ssl_certificate /etc/ssl/wtc-ui/wtc-ui.crt;
+    ssl_certificate_key /etc/ssl/wtc-ui/wtc-ui.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    root /mnt/ramdisk/ui;
+    client_max_body_size 10240m;
+    client_body_temp_path /var/tmp/nginx-body 1 2;
+    client_body_timeout 3600s;
+    send_timeout 3600s;
+    index index.php index.html;
+
+    include /etc/nginx/mime.types;
+    types {
+        image/jpeg jpg jpeg JPG JPEG;
+        image/png png PNG;
+        image/gif gif GIF;
+        image/webp webp WEBP;
+        image/svg+xml svg svgz SVG SVGZ;
+        image/x-icon ico ICO;
+        image/avif avif AVIF;
+        text/css css;
+        application/javascript js mjs;
+        application/json json map;
+        font/woff2 woff2;
+        font/woff woff;
+        font/ttf ttf;
+    }
+    default_type application/octet-stream;
+
+    location / {
+        try_files \$uri \$uri/ /index.php\$is_args\$args;
+    }
+
+    location ~ \.php$ {
+        try_files \$uri =404;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT \$realpath_root;
+        fastcgi_pass unix:/run/php/wtc-ui.sock;
+        fastcgi_connect_timeout 3600s;
+        fastcgi_read_timeout 3600s;
+        fastcgi_send_timeout 3600s;
     }
 }
 EOF
@@ -494,7 +583,7 @@ rm -f /etc/nginx/sites-enabled/default
 echo "==> Installing systemd units"
 cat > /etc/systemd/system/wtc-ramdisk.service <<'EOF'
 [Unit]
-Description=WTC RAM disk and active site loader
+Description=WTC RAM disk and Management UI loader
 Before=nginx.service
 After=local-fs.target
 
@@ -503,6 +592,22 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/wtc-site-service --boot
 ExecStop=/usr/local/bin/wtc-site-service --shutdown
+
+[Install]
+WantedBy=multi-user.target
+EOF
+cat > /etc/systemd/system/wtc-site-loader.service <<EOF
+[Unit]
+Description=WTC Site RAM Loader (Transfers Sites from SD to RAM)
+Requires=wtc-ramdisk.service
+After=wtc-ramdisk.service nginx.service $FPM_UNIT mariadb.service redis.service wtc-network.service
+Wants=mariadb.service redis.service wtc-network.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/wtc-site-service --boot-sites
+TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target
@@ -561,8 +666,8 @@ EOF
 cat > /etc/systemd/system/wtc-workers.service <<'EOF'
 [Unit]
 Description=WTC Background Workers Daemon (Laravel Queue & Scheduler)
-After=wtc-ramdisk.service mariadb.service redis.service
-Wants=wtc-ramdisk.service
+After=wtc-ramdisk.service wtc-site-loader.service mariadb.service redis.service
+Wants=wtc-ramdisk.service wtc-site-loader.service
 
 [Service]
 Type=simple
@@ -626,7 +731,7 @@ fi
 
 echo "==> Enabling services"
 systemctl daemon-reload
-systemctl enable wtc-ramdisk.service wtc-dropbox.path wtc-save.timer wtc-workers.service nginx "$FPM_UNIT" ssh avahi-daemon
+systemctl enable wtc-ramdisk.service wtc-site-loader.service wtc-dropbox.path wtc-save.timer wtc-workers.service nginx "$FPM_UNIT" ssh avahi-daemon
 [ "$ENABLE_FTP" = yes ] && systemctl enable vsftpd || true
 
 echo "==> Optimizing boot performance & eliminating wait-online stalls"

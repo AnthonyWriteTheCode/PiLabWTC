@@ -12,8 +12,9 @@ $set = wj('settings');
     <h3>Server & Memory Limits</h3>
     <?php
     $inputs = [
-        'RAM_SIZE'    => 'RAM Disk Size (e.g. 512M, 1G)',
-        'DROP_MAX_MB' => 'Max extracted archive size (MB)'
+        'RAM_SIZE'      => 'RAM Disk Size (e.g. 512M, 1G)',
+        'DROP_MAX_MB'   => 'Max extracted archive size (MB)',
+        'ROLLBACK_KEEP' => 'Max rollback versions per site (0 = unlimited)'
     ];
     foreach ($inputs as $k => $l):
     ?>
@@ -44,6 +45,25 @@ $set = wj('settings');
             <?= form('setting', ['key' => $k, 'value' => $on ? 'no' : 'yes', 'back' => 'settings'], $on ? 'Disable' : 'Enable') ?>
         </p>
     <?php endforeach; ?>
+</div>
+
+<div class="card" style="margin-top:16px;border-color:#238636">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <h3 style="margin:0;color:#7ee787">🔒 HTTPS &amp; TLS for Live Sites</h3>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <a href="/?download_ui_cert=1" download="pilabwtc-ui.crt" class="btn no-spa" style="font-size:0.8rem;padding:4px 10px;text-decoration:none">⬇️ Download Cert (.crt)</a>
+            <button type="button" class="btn" style="font-size:0.8rem;padding:4px 10px" onclick="if(window.openHttpsCertModal) openHttpsCertModal()">📖 Trust Guide</button>
+        </div>
+    </div>
+    <p style="color:#8b949e;font-size:0.85rem;margin:8px 0 14px 0">
+        When enabled, all HTTP requests to your live sites (Port 80 &amp; 8080) and dedicated-port sites automatically redirect to HTTPS using the Pi's trusted certificate (<code>pilabwtc-ui.crt</code>), and Laravel <code>APP_URL</code>s are updated to <code>https://</code>.
+    </p>
+    <?php $forceHttpsOn = ($set['FORCE_HTTPS'] ?? 'no') === 'yes'; ?>
+    <p style="margin:0">
+        <b>Force HTTPS on Live Sites:</b>
+        <?= $forceHttpsOn ? '<span class="pill ok">Enabled (HTTPS Only)</span>' : '<span class="pill off">Disabled (HTTP + HTTPS)</span>' ?>
+        <?= form('setting', ['key' => 'FORCE_HTTPS', 'value' => $forceHttpsOn ? 'no' : 'yes', 'back' => 'settings'], $forceHttpsOn ? 'Disable Force HTTPS' : 'Enable Force HTTPS', $forceHttpsOn ? '' : 'btn-pri') ?>
+    </p>
 </div>
 
 <div class="card" style="margin-top:16px;border-color:#1f6feb">

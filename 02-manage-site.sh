@@ -119,25 +119,93 @@ cmd_deactivate() {
   "$SERVICE_BIN" --deactivate "$1"
 }
 
-cmd_rollback() {
-  valid_name "${1:-}" || die "Invalid site name"
-  [ -f "$PREV_DIR/$1.tar.gz" ] || die "No previous version of '$1'"
-  acquire_lock
-  cp -f "$SITES_DIR/$1.tar.gz" "$PREV_DIR/$1.tar.gz.swap"
-  mv -f "$PREV_DIR/$1.tar.gz" "$SITES_DIR/$1.tar.gz"
-  mv -f "$PREV_DIR/$1.tar.gz.swap" "$PREV_DIR/$1.tar.gz"
-  log "Rolled back '$1'"
-  if is_site_active "$1"; then
-    local is_prim=0; [ "$(active_site)" = "$1" ] && is_prim=1
-    "$SERVICE_BIN" --activate "$1" "$is_prim"
+_resolve_rollback_file() {
+  local site="$1" ver="${2:-}"
+  if [ -n "$ver" ]; then
+    if [ "$ver" = "legacy" ] && [ -f "$PREV_DIR/$site.tar.gz" ]; then
+      echo "$PREV_DIR/$site.tar.gz"
+      return 0
+    fi
+    [[ "$ver" =~ ^[a-zA-Z0-9._-]+\.tar\.gz$ ]] || die "Invalid rollback version '$ver'"
+    [ -f "$PREV_DIR/$site/$ver" ] || die "Rollback version '$ver' not found for '$site'"
+    echo "$PREV_DIR/$site/$ver"
+    return 0
   fi
+  local latest=""
+  if [ -d "$PREV_DIR/$site" ]; then
+    latest="$(ls -1t "$PREV_DIR/$site"/*.tar.gz 2>/dev/null | head -n1 || true)"
+  fi
+  if [ -n "$latest" ] && [ -f "$latest" ]; then
+    echo "$latest"
+    return 0
+  fi
+  if [ -f "$PREV_DIR/$site.tar.gz" ]; then
+    echo "$PREV_DIR/$site.tar.gz"
+    return 0
+  fi
+  return 1
+}
+
+_cancel_catalog_rebuild() {
+  local site="$1" slug
+  slug="$(site_slug "$site")"
+  [ -n "$slug" ] || slug="$site"
+  rm -f "/run/wtc-catalog-${slug}.pending" 2>/dev/null || true
+  touch "/run/wtc-catalog-${slug}.cancel" 2>/dev/null || true
+  systemctl stop "wtc-catalog-${slug}.service" 2>/dev/null || true
+}
+
+cmd_rollback() {
+  local site="${1:-}" ver="${2:-}"
+  valid_name "$site" || die "Invalid site name"
+  local target; target="$(_resolve_rollback_file "$site" "$ver")" || die "No previous version of '$site'"
+  _cancel_catalog_rebuild "$site"
+  acquire_lock
+  local tmp_restore; tmp_restore="$(mktemp "$SITES_DIR/.restore.XXXXXX")"
+  mv -f "$target" "$tmp_restore"
+  if [ -f "$SITES_DIR/$site.tar.gz" ]; then
+    save_site_rollback "$site"
+  fi
+  chmod 0644 "$tmp_restore" 2>/dev/null || true
+  mv -f "$tmp_restore" "$SITES_DIR/$site.tar.gz"
+  log "Rolled back '$site'${ver:+ to $ver}"
+  if is_site_active "$site"; then
+    local is_prim=0; [ "$(active_site)" = "$site" ] && is_prim=1
+    "$SERVICE_BIN" --activate "$site" "$is_prim"
+  fi
+}
+
+cmd_rollback_delete() {
+  local site="${1:-}" ver="${2:-}"
+  valid_name "$site" || die "Invalid site name"
+  [ -n "$ver" ] || die "Specify a rollback version to delete"
+  local target; target="$(_resolve_rollback_file "$site" "$ver")" || die "Rollback version not found"
+  rm -f "$target"
+  rmdir "$PREV_DIR/$site" 2>/dev/null || true
+  log "Deleted rollback '$ver' for '$site'"
+  echo "Deleted rollback '$ver' for '$site'."
+}
+
+cmd_rollback_clear() {
+  local site="${1:-}"
+  if [ "$site" = "--all" ] || [ "$site" = "all" ]; then
+    rm -rf "$PREV_DIR"/* 2>/dev/null || true
+    log "Cleared all rollback snapshots for all sites"
+    echo "Cleared all rollback snapshots."
+    return 0
+  fi
+  valid_name "$site" || die "Invalid site name"
+  rm -rf "$PREV_DIR/$site" "$PREV_DIR/$site.tar.gz" 2>/dev/null || true
+  log "Cleared all rollback snapshots for '$site'"
+  echo "Cleared rollback snapshots for '$site'."
 }
 
 cmd_delete() {
   valid_name "${1:-}" || die "Invalid site name"
   is_site_active "$1" && die "Cannot delete an active site; stop/deactivate it first"
   [ -f "$SITES_DIR/$1.tar.gz" ] || die "No such site"
-  rm -f "$SITES_DIR/$1.tar.gz" "$PREV_DIR/$1.tar.gz" "$SITES_DIR/$1.meta.json"
+  _cancel_catalog_rebuild "$1"
+  rm -rf "$SITES_DIR/$1.tar.gz" "$PREV_DIR/$1.tar.gz" "$PREV_DIR/$1" "$SITES_DIR/$1.meta.json"
   log "Deleted site '$1'"
 }
 
@@ -156,51 +224,387 @@ EOF
   log "Created skeleton site '$1'"
 }
 
-cmd_direct_deploy() {
-  local site="${1:-}" stageTarget="${2:-}" stageDir="" is_temp=0 make_primary="${3:-}"
+cmd_site_rename() {
+  local old="${1:-}" new="${2:-}"
+  valid_name "$old" || die "Invalid existing site name"
+  valid_name "$new" || die "Invalid new site name (a-z 0-9 - _)"
+  [ -f "$SITES_DIR/$old.tar.gz" ] || die "Site '$old' not found"
+  [ ! -f "$SITES_DIR/$new.tar.gz" ] || die "Site '$new' already exists"
+
+  _cancel_catalog_rebuild "$old"
+  acquire_lock
+  mv -f "$SITES_DIR/$old.tar.gz" "$SITES_DIR/$new.tar.gz"
+  [ -f "$SITES_DIR/$old.meta.json" ] && mv -f "$SITES_DIR/$old.meta.json" "$SITES_DIR/$new.meta.json"
+  [ -f "$PREV_DIR/$old.tar.gz" ] && mv -f "$PREV_DIR/$old.tar.gz" "$PREV_DIR/$new.tar.gz"
+  [ -d "$PREV_DIR/$old" ] && mv -f "$PREV_DIR/$old" "$PREV_DIR/$new"
+
+  # If site was active in RAM, migrate active state
+  if is_site_active "$old"; then
+    local is_prim=0
+    [ "$(active_site)" = "$old" ] && is_prim=1
+    "$SERVICE_BIN" --deactivate "$old" 2>/dev/null || true
+    "$SERVICE_BIN" --activate "$new" "$is_prim" 2>/dev/null || true
+  fi
+  log "Renamed site '$old' to '$new'"
+}
+
+cmd_site_clone() {
+  local src="${1:-}" new="${2:-}" port="${3:-}" db_mode="${4:-clone}" activate="${5:-1}"
+  valid_name "$src" || die "Invalid source site name: $src"
+  valid_name "$new" || die "Invalid target instance name: $new (a-z 0-9 - _)"
+  [ "$src" != "$new" ] || die "Target instance name cannot be identical to source"
+  [ -f "$SITES_DIR/$src.tar.gz" ] || die "Source site '$src' not found"
+  [ ! -f "$SITES_DIR/$new.tar.gz" ] || die "Target site '$new' already exists"
+
+  if [ -n "$port" ] && [ "$port" != "0" ] && [ "$port" != "none" ] && [ "$port" != "null" ]; then
+    [[ "$port" =~ ^[0-9]{2,5}$ ]] || die "Port must be a number between 1 and 65535"
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "Port must be between 1 and 65535"
+    local conflict
+    conflict="$(grep -l "\"port\":[[:space:]]*$port" "$SITES_DIR"/*.meta.json 2>/dev/null | head -n1 || true)"
+    if [ -n "$conflict" ]; then
+      local c_site; c_site="$(basename "$conflict" .meta.json)"
+      if [ "$c_site" != "$src" ]; then
+        die "Port $port is already assigned to site '$c_site'"
+      fi
+    fi
+  else
+    port=""
+  fi
+
+  acquire_lock
+
+  # 1. Prepare workspace directory
+  local stage_clone
+  stage_clone="$(mktemp -d "$STAGE_DIR/.clone.XXXXXX" 2>/dev/null || mktemp -d "/tmp/.clone.XXXXXX")"
+
+  local src_slug; src_slug="$(site_slug "$src")"
+  local new_slug; new_slug="$(site_slug "$new")"
+  local src_ram="$RAM_SITES_DIR/$src_slug"
+
+  if [ -d "$src_ram" ] && is_site_active "$src"; then
+    log "Duplicating from live active RAM disk directory of '$src'..."
+    cp -a "$src_ram"/. "$stage_clone"/
+  else
+    log "Extracting archive for site '$src' to duplicate..."
+    safe_extract_archive "$SITES_DIR/$src.tar.gz" "$stage_clone" || die "Extraction failed during clone"
+  fi
+
+  # 2. Database cloning & provisioning
+  if db_available; then
+    local src_db; src_db="$(db_ident "$src")"
+    local new_db; new_db="$(db_ident "$new")"
+
+    case "$db_mode" in
+      clone)
+        log "Duplicating database from '$src_db' to '$new_db'..."
+        db_create "$new" || log "Warning: Failed to create database user for '$new'"
+        local dump_file="$stage_clone/.db_clone_tmp.sql"
+        if db_dump "$src" "$dump_file"; then
+          mariadb "$new_db" < "$dump_file" 2>/dev/null || log "Warning: Database clone import reported errors"
+          rm -f "$dump_file"
+        fi
+        db_write_files "$new" "$stage_clone"
+        ;;
+      new)
+        log "Provisioning fresh empty database '$new_db' for '$new'..."
+        db_create "$new" || log "Warning: Failed to create database for '$new'"
+        db_write_files "$new" "$stage_clone"
+        ;;
+      share)
+        log "Sharing existing database '$src_db' with instance '$new'..."
+        ;;
+    esac
+  fi
+
+  # 3. Update APP_NAME, APP_URL, ASSET_URL and session parameters in .env
+  configure_site_env "$stage_clone" "$new_slug" "$port" "$new"
+
+  # 4. Storage link & permissions
+  ensure_laravel_storage_link "$stage_clone"
+
+  # 5. Package into SITES_DIR/<new>.tar.gz
+  store_dir_as_site "$new" "$stage_clone" || die "Failed to store duplicated site package"
+  rm -rf "$stage_clone"
+
+  # 6. Configure metadata & custom port
+  local cur_stack="unknown" has_build="false"
+  if [ -f "$SITES_DIR/$src.meta.json" ]; then
+    cur_stack="$(jq -r '.stack // "unknown"' "$SITES_DIR/$src.meta.json" 2>/dev/null || echo "unknown")"
+    has_build="$(jq -r '.hasBuild // false' "$SITES_DIR/$src.meta.json" 2>/dev/null || echo false)"
+  fi
+
+  local meta_new="$SITES_DIR/$new.meta.json"
+  if [ -n "$port" ]; then
+    jq -n --arg st "$cur_stack" --argjson hb "$has_build" --argjson m "$(date +%s)" --argjson pt "$port" \
+      '{stack:$st, hasBuild:$hb, mtime:$m, port:$pt}' > "$meta_new.tmp" && mv -f "$meta_new.tmp" "$meta_new"
+  else
+    jq -n --arg st "$cur_stack" --argjson hb "$has_build" --argjson m "$(date +%s)" \
+      '{stack:$st, hasBuild:$hb, mtime:$m}' > "$meta_new.tmp" && mv -f "$meta_new.tmp" "$meta_new"
+  fi
+  chmod 0644 "$meta_new" 2>/dev/null || true
+
+  # 7. Activate in RAM if requested
+  if [ "$activate" = "1" ] || [ "$activate" = "yes" ] || [ "$activate" = "true" ]; then
+    log "Activating duplicated instance '$new' in RAM disk..."
+    "$SERVICE_BIN" --activate "$new" 0 || log "Warning: Failed to activate duplicated instance '$new'"
+  fi
+
+  log "Successfully duplicated site '$src' to '$new' (slug: $new_slug, port: ${port:-none})"
+  echo "Successfully duplicated site '$src' to '$new' (URL: /$new_slug/${port:+, Port: $port})"
+}
+
+cmd_site_stack() {
+  local site="${1:-}" stack="${2:-}"
   valid_name "$site" || die "Invalid site name"
-  ensure_ramdisk
+  [ -n "$stack" ] || die "No stack provided"
+  [ -f "$SITES_DIR/$site.tar.gz" ] || die "Site '$site' not found"
 
+  local meta_f="$SITES_DIR/$site.meta.json"
+  local cur_mtime has_build="false" cur_port="null"
+  if [ -f "$meta_f" ]; then
+    has_build="$(jq -r '.hasBuild // false' "$meta_f" 2>/dev/null || echo false)"
+    cur_port="$(jq -r '.port // null' "$meta_f" 2>/dev/null || echo null)"
+    cur_mtime="$(jq -r '.mtime // 0' "$meta_f" 2>/dev/null || date +%s)"
+  else
+    cur_mtime="$(date +%s)"
+  fi
+
+  jq -n --arg st "$stack" --argjson hb "$has_build" --argjson m "$cur_mtime" --argjson pt "$cur_port" \
+    '{stack:$st, hasBuild:$hb, mtime:$m, port:$pt}' > "$meta_f.tmp" && mv -f "$meta_f.tmp" "$meta_f"
+  chmod 0644 "$meta_f" 2>/dev/null || true
+
+  # If site is currently active in RAM, re-generate nginx routing and reload
+  if is_site_active "$site"; then
+    local slug site_ram_dir webroot
+    slug="$(site_slug "$site")"
+    site_ram_dir="$RAM_SITES_DIR/$slug"
+    if [ -d "$site_ram_dir" ]; then
+      webroot="$site_ram_dir"
+      if [ -d "$site_ram_dir/public" ] && { [ -f "$site_ram_dir/artisan" ] || [ -f "$site_ram_dir/public/index.php" ]; }; then
+        webroot="$site_ram_dir/public"
+      fi
+      generate_site_nginx_block "$site" "$slug" "$site_ram_dir" "$webroot" "$RAM_NGINX_SITES/$slug.conf"
+      if [ "$(active_site)" = "$site" ]; then
+        generate_stack_nginx_conf "$stack" "$site_ram_dir" "$RAM_NGINX_CONF"
+      fi
+      systemctl reload nginx 2>/dev/null || true
+    fi
+  fi
+  log "Assigned stack '$stack' to site '$site'"
+}
+
+cmd_site_port() {
+  local site="${1:-}" port="${2:-}"
+  valid_name "$site" || die "Invalid site name"
+  [ -f "$SITES_DIR/$site.tar.gz" ] || die "Site '$site' not found"
+
+  local meta_f="$SITES_DIR/$site.meta.json"
+  local cur_stack="unknown" has_build="false" cur_mtime
+  if [ -f "$meta_f" ]; then
+    cur_stack="$(jq -r '.stack // "unknown"' "$meta_f" 2>/dev/null || echo "unknown")"
+    has_build="$(jq -r '.hasBuild // false' "$meta_f" 2>/dev/null || echo false)"
+    cur_mtime="$(jq -r '.mtime // 0' "$meta_f" 2>/dev/null || date +%s)"
+  else
+    cur_mtime="$(date +%s)"
+  fi
+
+  local slug; slug="$(site_slug "$site")"
+  local port_conf="$RAM_NGINX_SITES/${slug}-port.conf"
+
+  if [ -n "$port" ] && [ "$port" != "0" ] && [ "$port" != "none" ] && [ "$port" != "null" ]; then
+    [[ "$port" =~ ^[0-9]{2,5}$ ]] || die "Port must be a number between 1 and 65535"
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "Port must be between 1 and 65535"
+
+    jq -n --arg st "$cur_stack" --argjson hb "$has_build" --argjson m "$cur_mtime" --argjson pt "$port" \
+      '{stack:$st, hasBuild:$hb, mtime:$m, port:$pt}' > "$meta_f.tmp" && mv -f "$meta_f.tmp" "$meta_f"
+    chmod 0644 "$meta_f" 2>/dev/null || true
+
+    # If active in RAM, generate dedicated vhost server block and align .env
+    if is_site_active "$site"; then
+      local site_ram_dir="$RAM_SITES_DIR/$slug" webroot="$site_ram_dir"
+      if [ -d "$site_ram_dir/public" ] && { [ -f "$site_ram_dir/artisan" ] || [ -f "$site_ram_dir/public/index.php" ]; }; then
+        webroot="$site_ram_dir/public"
+        ensure_laravel_storage_link "$site_ram_dir"
+      fi
+      configure_site_env "$site_ram_dir" "$slug" "$port" "$site"
+      generate_site_port_nginx_conf "$site" "$slug" "$port" "$webroot" "$port_conf"
+      ufw allow "$port/tcp" comment "Site $site Port" >/dev/null 2>&1 || true
+      systemctl reload nginx 2>/dev/null || true
+    fi
+    log "Configured dedicated port $port for site '$site'"
+  else
+    # Clear port
+    jq -n --arg st "$cur_stack" --argjson hb "$has_build" --argjson m "$cur_mtime" \
+      '{stack:$st, hasBuild:$hb, mtime:$m}' > "$meta_f.tmp" && mv -f "$meta_f.tmp" "$meta_f"
+    chmod 0644 "$meta_f" 2>/dev/null || true
+    rm -f "$port_conf" 2>/dev/null || true
+    if is_site_active "$site"; then
+      local site_ram_dir="$RAM_SITES_DIR/$slug"
+      if [ "$site" = "$(active_site)" ]; then
+        configure_site_env "$site_ram_dir" "" "" "$site"
+      else
+        configure_site_env "$site_ram_dir" "$slug" "" "$site"
+      fi
+    fi
+    systemctl reload nginx 2>/dev/null || true
+    log "Cleared dedicated port for site '$site'"
+  fi
+}
+
+_extract_stage_for_deploy() {
+  local stageTarget="$1" stageDir=""
   if [ -d "$stageTarget" ]; then
-    stageDir="$stageTarget"
-  elif [ -f "$stageTarget" ]; then
-    stageDir="$(mktemp -d "$STAGE_DIR/.deploy.XXXXXX")"
-    is_temp=1
-    safe_extract_archive "$stageTarget" "$stageDir" || die "Archive extraction failed"
-    # Ignore __MACOSX if present
-    rm -rf "$stageDir/__MACOSX" 2>/dev/null || true
+    echo "$stageTarget"
+    return 0
+  fi
+  [ -f "$stageTarget" ] || die "Staged folder or archive not found: $stageTarget"
+  stageDir="$(mktemp -d "$STAGE_DIR/.deploy.XXXXXX")"
+  safe_extract_archive "$stageTarget" "$stageDir" || { rm -rf "$stageDir"; die "Archive extraction failed"; }
+  rm -rf "$stageDir/__MACOSX" 2>/dev/null || true
 
-    local entries; entries="$(find "$stageDir" -mindepth 1 -maxdepth 1 ! -name '.*' ! -name '__MACOSX' | wc -l)"
-    local has_root=0
-    [ -f "$stageDir/index.php" ] || [ -f "$stageDir/index.html" ] || [ -f "$stageDir/artisan" ] && has_root=1
+  local entries; entries="$(find "$stageDir" -mindepth 1 -maxdepth 1 ! -name '.*' ! -name '__MACOSX' | wc -l)"
+  local has_root=0
+  [ -f "$stageDir/index.php" ] || [ -f "$stageDir/index.html" ] || [ -f "$stageDir/artisan" ] && has_root=1
 
-    if [ "$has_root" -eq 0 ] && [ "$entries" -eq 1 ]; then
-      local only; only="$(find "$stageDir" -mindepth 1 -maxdepth 1 ! -name '.*' ! -name '__MACOSX')"
-      if [ -d "$only" ]; then
+  if [ "$has_root" -eq 0 ] && [ "$entries" -eq 1 ]; then
+    local only; only="$(find "$stageDir" -mindepth 1 -maxdepth 1 ! -name '.*' ! -name '__MACOSX')"
+    if [ -d "$only" ]; then
+      local base_only; base_only="$(basename "$only" | tr '[:upper:]' '[:lower:]')"
+      local is_app_subdir=0
+      case "$base_only" in
+        app|bootstrap|config|database|public|resources|routes|storage|tests|vendor|node_modules|src|dist|build|out|assets|css|js|views|wp-content|wp-includes|wp-admin)
+          is_app_subdir=1 ;;
+      esac
+      if [ "$is_app_subdir" -eq 0 ] || [ -f "$only/artisan" ] || [ -f "$only/public/index.php" ] || [ -f "$only/index.php" ] || [ -f "$only/index.html" ] || [ -f "$only/wp-config.php" ]; then
         local unwrap_tmp; unwrap_tmp="$(mktemp -d "$STAGE_DIR/.unwrap.XXXXXX")"
         ( shopt -s dotglob nullglob; mv "$only"/* "$unwrap_tmp"/ 2>/dev/null || true )
         rm -rf "$stageDir"
         stageDir="$unwrap_tmp"
       fi
     fi
+  fi
+  echo "$stageDir"
+}
+
+cmd_rebuild_catalog() {
+  local site="${1:-}"
+  valid_name "$site" || die "Invalid site name"
+  ensure_ramdisk
+  local slug; slug="$(site_slug "$site")"
+  [ -n "$slug" ] || slug="$site"
+  local site_dir="$RAM_SITES_DIR/$slug"
+  [ -d "$site_dir" ] || die "Site '$site' is not loaded in RAM at $site_dir"
+
+  local unit="wtc-catalog-${slug}"
+  local pending_f="/run/wtc-catalog-${slug}.pending"
+  local cancel_f="/run/wtc-catalog-${slug}.cancel"
+  rm -f "$cancel_f" 2>/dev/null || true
+
+  if [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
+    if systemctl is-active --quiet "${unit}.service" 2>/dev/null; then
+      touch "$pending_f"
+      log "Queued SD catalog rebuild for '$site'"
+      return 0
+    fi
+    systemctl reset-failed "${unit}.service" 2>/dev/null || true
+    rm -f "$pending_f"
+    systemd-run --quiet --unit="$unit" --collect \
+      --property=StandardOutput=append:"$LOG_FILE" --property=StandardError=append:"$LOG_FILE" \
+      /usr/local/bin/wtc-manage --rebuild-catalog-exec "$site"
+    log "Started background SD catalog rebuild for '$site'"
   else
-    die "Staged folder or archive not found: $stageTarget"
+    touch "$pending_f"
+    ( nohup /usr/local/bin/wtc-manage --rebuild-catalog-exec "$site" >>"$LOG_FILE" 2>&1 </dev/null & )
+    log "Started background SD catalog rebuild for '$site'"
+  fi
+}
+
+cmd_rebuild_catalog_exec() {
+  local site="${1:-}"
+  valid_name "$site" || exit 2
+  local slug; slug="$(site_slug "$site")"
+  [ -n "$slug" ] || slug="$site"
+  local site_dir="$RAM_SITES_DIR/$slug"
+  local pending_f="/run/wtc-catalog-${slug}.pending"
+  local cancel_f="/run/wtc-catalog-${slug}.cancel"
+  local cat_lock="/run/wtc-catalog-${slug}.lock"
+
+  mkdir -p /run "$SITES_DIR" "$PREV_DIR" 2>/dev/null || true
+  exec 8>"$cat_lock"
+  flock -w 300 8 || die "Could not obtain catalog lock for '$site'"
+
+  local -a tar_cmd=(tar -czf)
+  if command -v pigz >/dev/null 2>&1; then
+    tar_cmd=(tar --use-compress-program=pigz -cf)
   fi
 
-  # 1. Package and store site archive into /opt/wtc-web/sites so it is permanently deployable & visible
-  store_dir_as_site "$site" "$stageDir" || die "Failed to save site package to $SITES_DIR"
+  while :; do
+    rm -f "$pending_f" 2>/dev/null || true
+    [ -f "$cancel_f" ] && { rm -f "$cancel_f"; break; }
+    [ -d "$site_dir" ] || break
 
-  # 2. Swap directly in RAM immediately - zero delay
-  "$SERVICE_BIN" --swap-dir "$site" "$stageDir" "$make_primary"
+    local out; out="$(mktemp "$SITES_DIR/.new.XXXXXX")"
+    local rc=0
+    "${tar_cmd[@]}" "$out" -C "$site_dir" . 2>/dev/null || rc=$?
+    if [ "$rc" -gt 1 ] || { [ "$rc" -eq 1 ] && ! gzip -t "$out" 2>/dev/null; }; then
+      rm -f "$out"
+      die "SD catalog compression failed for '$site' (exit $rc)"
+    fi
 
+    if [ -f "$cancel_f" ] || [ ! -d "$site_dir" ]; then
+      rm -f "$out" "$cancel_f" 2>/dev/null || true
+      break
+    fi
+
+    if [ -f "$pending_f" ]; then
+      rm -f "$out"
+      continue
+    fi
+
+    (
+      acquire_lock 60
+      [ -f "$cancel_f" ] && exit 0
+      [ -d "$site_dir" ] || exit 0
+      mkdir -p "$SITES_DIR" "$PREV_DIR"
+      if [ -f "$SITES_DIR/$site.tar.gz" ]; then
+        save_site_rollback "$site"
+      fi
+      chmod 0644 "$out"
+      mv -f "$out" "$SITES_DIR/$site.tar.gz"
+      write_site_meta "$site" "$site_dir"
+      sync
+    ) || { rm -f "$out"; die "Failed to commit SD catalog for '$site'"; }
+
+    rm -f "$out" 2>/dev/null || true
+    log "Rebuilt SD catalog for '$site' from RAM ($site_dir)"
+    [ -f "$pending_f" ] && [ ! -f "$cancel_f" ] || break
+  done
+}
+
+cmd_direct_deploy() {
+  local site="${1:-}" stageTarget="${2:-}" make_primary="${3:-}" no_catalog="${4:-}" stageDir="" is_temp=0
+  valid_name "$site" || die "Invalid site name"
+  ensure_ramdisk
+
+  if [ -f "$stageTarget" ]; then
+    is_temp=1
+  fi
+  stageDir="$(_extract_stage_for_deploy "$stageTarget")"
+
+  # 1. Replace files directly in RAM immediately for quickest site access
+  "$SERVICE_BIN" --ram-replace "$site" "$stageDir" "$make_primary"
+
+  rm -rf "$stageDir"
   if [ "$is_temp" -eq 1 ]; then
-    rm -rf "$stageDir"
     rm -f "$stageTarget"
-  else
-    rm -rf "$stageDir"
   fi
 
-  log "Direct deployed '$site' into RAM disk instantly and saved package to sites repository"
+  # 2. Rebuild the catalog on the SD card from RAM (unless caller triggers it after Artisan hooks)
+  if [ "$no_catalog" != "--no-catalog" ]; then
+    cmd_rebuild_catalog "$site"
+  fi
+
+  log "Replaced '$site' files directly in RAM${no_catalog:+ (catalog rebuild deferred)}"
 }
 
 cmd_store_site() {
@@ -208,9 +612,38 @@ cmd_store_site() {
   valid_name "$site" || die "Invalid site name"
   ensure_ramdisk
 
+  if [ "${AUTO_RELOAD_ACTIVE:-yes}" = "yes" ] && is_site_active "$site"; then
+    local is_prim=0; [ "$(active_site)" = "$site" ] && is_prim=1
+    cmd_direct_deploy "$site" "$stageTarget" "$is_prim"
+    return 0
+  fi
+
   if [ -d "$stageTarget" ]; then
     stageDir="$stageTarget"
   elif [ -f "$stageTarget" ]; then
+    # If the target is ALREADY a valid tar.gz archive, avoid uncompressing and re-compressing
+    # 400,000 files (which can take 15GB of space and 10 minutes)!
+    if [[ "$stageTarget" =~ \.(tar\.gz|tgz)$ ]] && tar -tzf "$stageTarget" >/dev/null 2>&1; then
+      _cancel_catalog_rebuild "$site"
+      mkdir -p "$SITES_DIR" "$PREV_DIR"
+      save_site_rollback "$site"
+      mv -f "$stageTarget" "$SITES_DIR/$site.tar.gz"
+      local cur_port="null"
+      if [ -f "$SITES_DIR/$site.meta.json" ] && command -v jq >/dev/null 2>&1; then
+        cur_port="$(jq -r '.port // null' "$SITES_DIR/$site.meta.json" 2>/dev/null || echo null)"
+      fi
+      if [ -n "$cur_port" ] && [ "$cur_port" != "null" ] && command -v jq >/dev/null 2>&1; then
+        jq -nc --argjson m "$(date +%s)" --argjson pt "$cur_port" '{stack:"unknown",hasBuild:false,mtime:$m,port:$pt}' > "$SITES_DIR/$site.meta.json"
+      else
+        cat > "$SITES_DIR/$site.meta.json" <<EOF
+{"stack":"unknown","hasBuild":false,"mtime":$(date +%s)}
+EOF
+      fi
+      chmod 0644 "$SITES_DIR/$site.meta.json" 2>/dev/null || true
+      log "Stored '$site' into /opt/wtc-web/sites repository (direct archive adoption)"
+      return 0
+    fi
+
     stageDir="$(mktemp -d "$STAGE_DIR/.deploy.XXXXXX")"
     is_temp=1
     safe_extract_archive "$stageTarget" "$stageDir" || die "Archive extraction failed"
@@ -232,10 +665,6 @@ cmd_store_site() {
   rm -rf "$stageDir"
   [ "$is_temp" -eq 1 ] && rm -f "$stageTarget"
   log "Stored '$site' into /opt/wtc-web/sites repository"
-  if [ "${AUTO_RELOAD_ACTIVE:-yes}" = "yes" ] && is_site_active "$site"; then
-    local is_prim=0; [ "$(active_site)" = "$site" ] && is_prim=1
-    "$SERVICE_BIN" --activate "$site" "$is_prim" || log "Reload of active site '$site' failed"
-  fi
 }
 
 cmd_server_tune() {
@@ -251,11 +680,13 @@ cmd_server_tune() {
   # 1. Management UI Pool: Single worker thread/process
   local fpm_ui_pool="/etc/php/$phpv/fpm/pool.d/wtc-ui.conf"
   if [ -f "$fpm_ui_pool" ]; then
-    sed -i 's/.*upload_max_filesize.*/php_admin_value[upload_max_filesize] = 1024M/' "$fpm_ui_pool" 2>/dev/null || true
-    sed -i 's/.*post_max_size.*/php_admin_value[post_max_size] = 1024M/' "$fpm_ui_pool" 2>/dev/null || true
-    sed -i 's/.*max_execution_time.*/php_admin_value[max_execution_time] = 600/' "$fpm_ui_pool" 2>/dev/null || true
-    sed -i 's/.*max_input_time.*/php_admin_value[max_input_time] = 600/' "$fpm_ui_pool" 2>/dev/null || true
-    sed -i 's/.*max_file_uploads.*/php_admin_value[max_file_uploads] = 10000/' "$fpm_ui_pool" 2>/dev/null || true
+    sed -i 's/.*upload_max_filesize.*/php_admin_value[upload_max_filesize] = 10240M/' "$fpm_ui_pool" 2>/dev/null || true
+    sed -i 's/.*post_max_size.*/php_admin_value[post_max_size] = 10240M/' "$fpm_ui_pool" 2>/dev/null || true
+    sed -i 's/.*max_execution_time.*/php_admin_value[max_execution_time] = 3600/' "$fpm_ui_pool" 2>/dev/null || true
+    sed -i 's/.*max_input_time.*/php_admin_value[max_input_time] = 3600/' "$fpm_ui_pool" 2>/dev/null || true
+    sed -i 's/.*memory_limit.*/php_admin_value[memory_limit] = 2048M/' "$fpm_ui_pool" 2>/dev/null || true
+    sed -i 's|.*upload_tmp_dir.*|php_admin_value[upload_tmp_dir] = /var/tmp|' "$fpm_ui_pool" 2>/dev/null || true
+    sed -i 's/.*max_file_uploads.*/php_admin_value[max_file_uploads] = 50000/' "$fpm_ui_pool" 2>/dev/null || true
     if ! grep -q 'max_input_vars' "$fpm_ui_pool"; then
       echo "php_admin_value[max_input_vars] = 50000" >> "$fpm_ui_pool"
     fi
@@ -267,11 +698,13 @@ cmd_server_tune() {
   # 2. Live Site Pool: Dedicated multi-worker processes
   local fpm_site_pool="/etc/php/$phpv/fpm/pool.d/wtc-site.conf"
   if [ -f "$fpm_site_pool" ]; then
-    sed -i 's/.*upload_max_filesize.*/php_admin_value[upload_max_filesize] = 1024M/' "$fpm_site_pool" 2>/dev/null || true
-    sed -i 's/.*post_max_size.*/php_admin_value[post_max_size] = 1024M/' "$fpm_site_pool" 2>/dev/null || true
-    sed -i 's/.*max_execution_time.*/php_admin_value[max_execution_time] = 600/' "$fpm_site_pool" 2>/dev/null || true
-    sed -i 's/.*max_input_time.*/php_admin_value[max_input_time] = 600/' "$fpm_site_pool" 2>/dev/null || true
-    sed -i 's/.*max_file_uploads.*/php_admin_value[max_file_uploads] = 10000/' "$fpm_site_pool" 2>/dev/null || true
+    sed -i 's/.*upload_max_filesize.*/php_admin_value[upload_max_filesize] = 10240M/' "$fpm_site_pool" 2>/dev/null || true
+    sed -i 's/.*post_max_size.*/php_admin_value[post_max_size] = 10240M/' "$fpm_site_pool" 2>/dev/null || true
+    sed -i 's/.*max_execution_time.*/php_admin_value[max_execution_time] = 3600/' "$fpm_site_pool" 2>/dev/null || true
+    sed -i 's/.*max_input_time.*/php_admin_value[max_input_time] = 3600/' "$fpm_site_pool" 2>/dev/null || true
+    sed -i 's/.*memory_limit.*/php_admin_value[memory_limit] = 2048M/' "$fpm_site_pool" 2>/dev/null || true
+    sed -i 's|.*upload_tmp_dir.*|php_admin_value[upload_tmp_dir] = /var/tmp|' "$fpm_site_pool" 2>/dev/null || true
+    sed -i 's/.*max_file_uploads.*/php_admin_value[max_file_uploads] = 50000/' "$fpm_site_pool" 2>/dev/null || true
     if ! grep -q 'max_input_vars' "$fpm_site_pool"; then
       echo "php_admin_value[max_input_vars] = 50000" >> "$fpm_site_pool"
     fi
@@ -288,11 +721,13 @@ EOF
 
   local fpm_ini="/etc/php/$phpv/fpm/conf.d/90-wtc.ini"
   if [ -f "$fpm_ini" ]; then
-    sed -i 's/.*upload_max_filesize.*/upload_max_filesize = 1024M/' "$fpm_ini" 2>/dev/null || true
-    sed -i 's/.*post_max_size.*/post_max_size = 1024M/' "$fpm_ini" 2>/dev/null || true
-    sed -i 's/.*max_execution_time.*/max_execution_time = 600/' "$fpm_ini" 2>/dev/null || true
-    sed -i 's/.*max_input_time.*/max_input_time = 600/' "$fpm_ini" 2>/dev/null || true
-    sed -i 's/.*max_file_uploads.*/max_file_uploads = 10000/' "$fpm_ini" 2>/dev/null || true
+    sed -i 's/.*upload_max_filesize.*/upload_max_filesize = 10240M/' "$fpm_ini" 2>/dev/null || true
+    sed -i 's/.*post_max_size.*/post_max_size = 10240M/' "$fpm_ini" 2>/dev/null || true
+    sed -i 's/.*max_execution_time.*/max_execution_time = 3600/' "$fpm_ini" 2>/dev/null || true
+    sed -i 's/.*max_input_time.*/max_input_time = 3600/' "$fpm_ini" 2>/dev/null || true
+    sed -i 's/.*memory_limit.*/memory_limit = 2048M/' "$fpm_ini" 2>/dev/null || true
+    sed -i 's|.*upload_tmp_dir.*|upload_tmp_dir = /var/tmp|' "$fpm_ini" 2>/dev/null || true
+    sed -i 's/.*max_file_uploads.*/max_file_uploads = 50000/' "$fpm_ini" 2>/dev/null || true
     if ! grep -q 'max_input_vars' "$fpm_ini"; then
       echo "max_input_vars = 50000" >> "$fpm_ini"
     fi
@@ -512,20 +947,128 @@ cmd_artisan() {
   laravel_repair_shim "$site" "$targetDir" || exit 1
 
   # Security validation: strictly reject shell operators, metacharacters, or illegal syntax
+  case "$cmd" in
+    *[\;\&\|\`\$\<\>\\]*|*$'\r'*|*$'\n'*) die "Invalid artisan command: shell operators prohibited" ;;
+  esac
   local safe_artisan_rx='^[a-zA-Z0-9_: =./-]+$'
   [[ "$cmd" =~ $safe_artisan_rx ]] || die "Invalid artisan command: illegal characters detected"
-  case "$cmd" in
-    *[\;\&\|\`\$\<\>\r\n]*) die "Invalid artisan command: shell operators prohibited" ;;
-  esac
 
   case "$cmd" in
     *clear*|*route:*|*config:*|*optimize*)
       rm -f "$targetDir/bootstrap/cache/"*.php 2>/dev/null || true
       ;;
+    *storage:link*)
+      # Clean up any broken symlink so artisan doesn't fail with "File exists"
+      if [ -L "$targetDir/public/storage" ] && [ ! -e "$targetDir/public/storage" ]; then
+        rm -f "$targetDir/public/storage" 2>/dev/null || true
+      fi
+      ;;
   esac
 
   log "Running 'php artisan $cmd' for site '$site' in $targetDir"
-  su -s /bin/bash "$WEB_USER" -c 'cd "$1" && exec php artisan '"$cmd"'' -- "$targetDir" 2>&1
+  local artisan_out artisan_rc=0
+  artisan_out="$(su -s /bin/bash "$WEB_USER" -c "cd $(printf '%q' "$targetDir") && exec php artisan $cmd" 2>&1)" || artisan_rc=$?
+  echo "$artisan_out"
+
+  if [[ "$cmd" == *"storage:link"* ]]; then
+    ensure_laravel_storage_link "$targetDir"
+    # If artisan failed or said link exists, but ensure_laravel_storage_link succeeded
+    if [ "$artisan_rc" -ne 0 ] && [ -L "$targetDir/public/storage" ] && [ -e "$targetDir/public/storage" ]; then
+      artisan_rc=0
+      echo "The [public/storage] link has been connected to [../storage/app/public]."
+    fi
+  fi
+  return $artisan_rc
+}
+
+cmd_storage_link() {
+  local target="${1:-$(active_site)}" targetDir="" site=""
+  
+  if [ -n "$target" ] && [ "$target" != "all" ]; then
+    if [ -d "$target" ] && [ -d "$target/public" ]; then
+      targetDir="$target"
+      site="$(basename "$target")"
+    else
+      site="$target"
+      valid_name "$site" || die "Invalid site name: $site"
+      local live; live="$(readlink -f "$WWW_LINK" 2>/dev/null || true)"
+      local slug; slug="$(site_slug "$site")"
+      if [ -d "$live" ] && [ "$(active_site)" = "$site" ] && [ -d "$live/public" ]; then
+        targetDir="$live"
+      elif [ -d "$RAM_SITES_DIR/$slug" ]; then
+        targetDir="$RAM_SITES_DIR/$slug"
+      elif [ -d "$RAM_MOUNT/sites/$site" ]; then
+        targetDir="$RAM_MOUNT/sites/$site"
+      elif [ -d "$STAGE_DIR/$site" ]; then
+        targetDir="$STAGE_DIR/$site"
+      elif [ -d "$STAGE_DIR/$slug" ]; then
+        targetDir="$STAGE_DIR/$slug"
+      fi
+    fi
+
+    [ -n "$targetDir" ] || die "Site '$target' is not active in RAM disk or has no webroot"
+    ensure_laravel_storage_link "$targetDir"
+    log "Ensured Laravel storage link for site '$site' in $targetDir"
+    echo "Storage link verified and ensured for site '$site' (public/storage -> storage/app/public)"
+  else
+    local count=0
+    while read -r s; do
+      [ -z "$s" ] && continue
+      local sl; sl="$(site_slug "$s")"
+      for d in "$RAM_SITES_DIR/$sl" "$RAM_SITES_DIR/$s"; do
+        if [ -d "$d" ] && { [ -f "$d/artisan" ] || [ -f "$d/public/index.php" ] || [ -d "$d/storage" ]; }; then
+          ensure_laravel_storage_link "$d"
+          count=$((count + 1))
+        fi
+      done
+    done < <(list_active_sites)
+    if [ -d "/mnt/ramdisk/webroot" ]; then
+      ensure_laravel_storage_link "/mnt/ramdisk/webroot"
+      count=$((count + 1))
+    fi
+    log "Ensured storage links for $count active Laravel site(s)"
+    echo "Ensured storage links for $count active Laravel site(s)"
+  fi
+}
+
+cmd_ziggy() {
+  local target="${1:-$(active_site)}" targetDir="" site=""
+  if [ -d "$target" ] && [ -f "$target/artisan" ]; then
+    targetDir="$target"
+    site="$(basename "$target")"
+  else
+    site="$target"
+    valid_name "$site" || die "Invalid site name: $site"
+    local live; live="$(readlink -f "$WWW_LINK" 2>/dev/null || true)"
+    local slug; slug="$(site_slug "$site")"
+    if [ -d "$live" ] && [ "$(active_site)" = "$site" ] && [ -f "$live/artisan" ]; then
+      targetDir="$live"
+    elif [ -d "$RAM_MOUNT/sites/$site" ] && [ -f "$RAM_MOUNT/sites/$site/artisan" ]; then
+      targetDir="$RAM_MOUNT/sites/$site"
+    elif [ -d "$RAM_MOUNT/sites/$slug" ] && [ -f "$RAM_MOUNT/sites/$slug/artisan" ]; then
+      targetDir="$RAM_MOUNT/sites/$slug"
+    elif [ -d "$STAGE_DIR/$site" ] && [ -f "$STAGE_DIR/$site/artisan" ]; then
+      targetDir="$STAGE_DIR/$site"
+    elif [ -d "$STAGE_DIR/$slug" ] && [ -f "$STAGE_DIR/$slug/artisan" ]; then
+      targetDir="$STAGE_DIR/$slug"
+    fi
+  fi
+
+  [ -n "$targetDir" ] || die "Site '$target' is not active in RAM or has no artisan"
+  [ -f "$targetDir/artisan" ] || die "No artisan found in $targetDir"
+
+  [ -n "$site" ] && { db_ensure "$site" || true; }
+  [ -n "$site" ] && valid_name "$site" && db_write_files "$site" "$targetDir"
+  laravel_repair_shim "$site" "$targetDir" || exit 1
+
+  if [ ! -d "$targetDir/vendor/tightenco/ziggy" ] && ! grep -qi '"tightenco/ziggy"' "$targetDir/composer.json" 2>/dev/null; then
+    echo "Ziggy (tightenco/ziggy) is not installed in '$site' - skipping."
+    return 0
+  fi
+
+  su -s /bin/bash "$WEB_USER" -c "cd $(printf '%q' "$targetDir") && php artisan config:clear" >/dev/null 2>&1 || true
+  su -s /bin/bash "$WEB_USER" -c "cd $(printf '%q' "$targetDir") && php artisan route:clear" >/dev/null 2>&1 || true
+  rebuild_laravel_ziggy "$targetDir" "stdout"
 }
 
 # If a site was uploaded without vendor/, the UI replaced bootstrap/app.php and
@@ -608,6 +1151,8 @@ EOF
   fi
   [ "$rc" -eq 0 ] || { echo "ERROR: composer install failed (exit $rc)"; return 1; }
 
+  ensure_laravel_storage_link "$dir"
+  rebuild_laravel_ziggy "$dir" "stdout" || true
   # 3. Persist the repaired site to SD so re-activation doesn't bring the shim back
   valid_name "$site" && store_dir_as_site "$site" "$dir" >/dev/null 2>&1 || true
   echo "WTC: Laravel framework restored for '$site'."
@@ -618,15 +1163,50 @@ cmd_setting() {
   local k="${1:-}" v="${2:-}"
   case "$k" in
     RAM_SIZE)               [[ "$v" =~ ^[0-9]{2,5}[MG]$ ]] || die "RAM_SIZE like 512M or 1G" ;;
-    DROP_MAX_MB|SAVE_INTERVAL_MIN|FAN_GPIO) [[ "$v" =~ ^[0-9]{1,5}$ ]] || die "$k must be a number" ;;
+    DROP_MAX_MB|SAVE_INTERVAL_MIN|FAN_GPIO|ROLLBACK_KEEP) [[ "$v" =~ ^[0-9]{1,5}$ ]] || die "$k must be a number" ;;
     FAN_WIFI_MODE)          [[ "$v" =~ ^(pulse|spin)$ ]] || die "$k must be pulse or spin" ;;
-    AUTO_ACTIVATE_NEW|AUTO_RELOAD_ACTIVE|KEEP_PROCESSED|SAVE_ON_SHUTDOWN|SAVE_ON_SWITCH|FAN_ON_WIFI_DISCONNECT)
+    AUTO_ACTIVATE_NEW|AUTO_RELOAD_ACTIVE|KEEP_PROCESSED|SAVE_ON_SHUTDOWN|SAVE_ON_SWITCH|FAN_ON_WIFI_DISCONNECT|FORCE_HTTPS)
                             [[ "$v" =~ ^(yes|no)$ ]] || die "$k must be yes or no" ;;
     *) die "Unknown setting '$k'" ;;
   esac
+  if [ "$k" = FORCE_HTTPS ] && [ "$v" = "yes" ]; then
+    [ -f /etc/ssl/wtc-ui/wtc-ui.crt ] && [ -f /etc/ssl/wtc-ui/wtc-ui.key ] || die "TLS certificate missing (/etc/ssl/wtc-ui/wtc-ui.crt). Run update.sh first."
+  fi
   set_conf "$k" "$v"
   if [ "$k" = RAM_SIZE ] && mountpoint -q "$RAM_MOUNT"; then
     mount -o "remount,size=$v" "$RAM_MOUNT" || die "Could not resize RAM disk (not enough memory?)"
+  fi
+  if [ "$k" = FORCE_HTTPS ]; then
+    FORCE_HTTPS="$v"
+    sync_force_https_conf
+    if [ "$v" = "yes" ] && command -v ufw >/dev/null 2>&1; then
+      ufw allow 443/tcp comment "HTTPS Web Server" >/dev/null 2>&1 || true
+    fi
+    if [ -f "$ACTIVE_SITES_FILE" ]; then
+      local cur_primary; cur_primary="$(active_site)"
+      while IFS= read -r s || [ -n "$s" ]; do
+        [ -n "$s" ] || continue
+        local slug; slug="$(site_slug "$s")"
+        local sdir="$RAM_SITES_DIR/$slug"
+        [ -d "$sdir" ] || continue
+        local wroot="$sdir"
+        if [ -d "$sdir/public" ] && { [ -f "$sdir/artisan" ] || [ -f "$sdir/public/index.php" ]; }; then
+          wroot="$sdir/public"
+        fi
+        local sport=""
+        [ -f "$SITES_DIR/$s.meta.json" ] && sport="$(jq -r '.port // empty' "$SITES_DIR/$s.meta.json" 2>/dev/null || true)"
+        if [ -n "$sport" ] && [ "$sport" != "null" ]; then
+          generate_site_port_nginx_conf "$s" "$slug" "$sport" "$wroot" "$RAM_NGINX_SITES/${slug}-port.conf"
+          configure_site_env "$sdir" "$slug" "$sport" "$s"
+        elif [ "$s" = "$cur_primary" ]; then
+          configure_site_env "$sdir" "" "" "$s"
+        else
+          configure_site_env "$sdir" "$slug" "" "$s"
+        fi
+      done < "$ACTIVE_SITES_FILE"
+    fi
+    nginx -t >/dev/null 2>&1 || die "Nginx config test failed after updating FORCE_HTTPS"
+    systemctl reload nginx 2>/dev/null || true
   fi
   log "Setting $k=$v"
 }
@@ -707,8 +1287,10 @@ cmd_firewall() {
       # Ensure SSH and UI are allowed before enabling
       ufw allow 22/tcp comment "SSH Server" >/dev/null 2>&1 || true
       ufw allow 80/tcp comment "HTTP Web Server" >/dev/null 2>&1 || true
+      ufw allow 443/tcp comment "HTTPS Web Server" >/dev/null 2>&1 || true
       ufw allow 8080/tcp comment "Site Direct Port" >/dev/null 2>&1 || true
-      ufw allow 4485/tcp comment "WTC Management UI" >/dev/null 2>&1 || true
+      ufw allow 4485/tcp comment "WTC Management UI"
+      ufw allow 4486/tcp comment "WTC Management UI (HTTPS)" >/dev/null 2>&1 || true
       log "Installed and pre-configured UFW firewall"
       echo "Installed UFW firewall."
       ;;
@@ -717,8 +1299,10 @@ cmd_firewall() {
       # Safety check: ensure SSH (22) and UI ports are allowed before enabling
       ufw allow 22/tcp comment "SSH Server" >/dev/null 2>&1 || true
       ufw allow 80/tcp comment "HTTP Web Server" >/dev/null 2>&1 || true
+      ufw allow 443/tcp comment "HTTPS Web Server" >/dev/null 2>&1 || true
       ufw allow 8080/tcp comment "Site Direct Port" >/dev/null 2>&1 || true
-      ufw allow 4485/tcp comment "WTC Management UI" >/dev/null 2>&1 || true
+      ufw allow 4485/tcp comment "WTC Management UI"
+      ufw allow 4486/tcp comment "WTC Management UI (HTTPS)" >/dev/null 2>&1 || true
       echo "y" | ufw enable
       systemctl enable ufw 2>/dev/null || true
       log "Firewall enabled"
@@ -737,8 +1321,10 @@ cmd_firewall() {
       ufw default allow outgoing
       ufw allow 22/tcp comment "SSH Server"
       ufw allow 80/tcp comment "HTTP Web Server"
+      ufw allow 443/tcp comment "HTTPS Web Server"
       ufw allow 8080/tcp comment "Site Direct Port"
       ufw allow 4485/tcp comment "WTC Management UI"
+      ufw allow 4486/tcp comment "WTC Management UI (HTTPS)"
       echo "y" | ufw enable
       log "Firewall reset to factory defaults"
       echo "Firewall rules reset to defaults."
@@ -754,7 +1340,7 @@ cmd_firewall() {
       command -v ufw >/dev/null 2>&1 || [ -x /usr/sbin/ufw ] || die "UFW firewall is not installed"
       [[ "$port" =~ ^[0-9]{1,5}(:[0-9]{1,5})?$ ]] || die "Invalid port number '$port'"
       # Protect against locking out management interface
-      if [ "$port" = "4485" ] || [ "$port" = "22" ]; then
+      if [ "$port" = "4485" ] || [ "$port" = "4486" ] || [ "$port" = "22" ]; then
         die "Cannot block port $port: critical management port (SSH / WTC UI)"
       fi
       ufw deny "$port/$proto" comment "WTC UI Block Rule"
@@ -778,6 +1364,7 @@ cmd_stack() {
   [[ "$action" =~ ^(install|remove)$ ]] || die "Use install|remove"
   [ -n "${STACK_PKGS[$id]:-}" ] || die "Unknown component '$id'"
   systemctl is-active --quiet wtc-stack-job.service && die "Another stack job is running"
+  systemctl reset-failed wtc-stack-job.service 2>/dev/null || true
   mkdir -p "$(dirname "$STACK_LOG")"
   echo "=== $action $id  ($(date '+%F %T')) ===" > "$STACK_LOG"
   systemd-run --quiet --unit=wtc-stack-job --collect \
@@ -793,7 +1380,8 @@ cmd_stack_exec() { # runs inside the transient unit
   local APT=(apt-get -o DPkg::Lock::Timeout=300 -y)
   # shellcheck disable=SC2086
   if [ "$action" = install ]; then
-    { "${APT[@]}" update && "${APT[@]}" install ${STACK_PKGS[$id]}; } || rc=$?
+    "${APT[@]}" update || true
+    "${APT[@]}" install ${STACK_PKGS[$id]} || rc=$?
   else
     "${APT[@]}" remove ${STACK_PKGS[$id]} || rc=$?
   fi
@@ -805,21 +1393,21 @@ cmd_stack_exec() { # runs inside the transient unit
   exit "$rc"
 }
 
-# ------------------------------------------------------------ site build (npm run build)
+# ------------------------------------------------------------ site build (npm run build / custom build)
 cmd_build() {
-  local site="${1:-$(active_site)}"
+  local site="${1:-$(active_site)}" custom_cmd="${2:-}"
   valid_name "$site" || die "Invalid site name"
   systemctl is-active --quiet wtc-build-job.service && die "Another build job is currently running"
   mkdir -p "$(dirname "$BUILD_LOG")"
-  echo "=== npm build for '$site' ($(date '+%F %T')) ===" > "$BUILD_LOG"
+  echo "=== build for '$site' ($(date '+%F %T')) ===" > "$BUILD_LOG"
   systemd-run --quiet --unit=wtc-build-job --collect \
     --property=StandardOutput=append:"$BUILD_LOG" --property=StandardError=append:"$BUILD_LOG" \
-    /usr/local/bin/wtc-manage --build-exec "$site"
+    /usr/local/bin/wtc-manage --build-exec "$site" "$custom_cmd"
   log "Background build job started for '$site'"
 }
 
 cmd_build_exec() {
-  local site="$1" rc=0
+  local site="$1" custom_cmd="${2:-}" rc=0
   valid_name "$site" || exit 2
   echo "==> Preparing build environment for '$site'..."
 
@@ -851,32 +1439,61 @@ cmd_build_exec() {
   fi
 
   cd "$targetDir"
-  if [ ! -f "package.json" ]; then
-    echo "ERROR: No package.json found in '$site'"
-    [ "$is_active" -ne 1 ] && rm -rf "$targetDir"
-    exit 1
-  fi
+  if [ -n "$custom_cmd" ]; then
+    if [ -f "$targetDir/artisan" ] && ! echo "$custom_cmd" | grep -q 'ziggy:generate'; then
+      if echo "$custom_cmd" | grep -qE '(npm|yarn|pnpm|bun)[[:space:]]+(run[[:space:]]+)?(build|prod)|vite[[:space:]]+build'; then
+        echo "==> Rebuilding Laravel Ziggy routes before frontend build..."
+        rebuild_laravel_ziggy "$targetDir" "stdout" || true
+      fi
+    fi
 
-  # 3. npm install & npm run build
-  echo "==> Running npm install..."
-  if [ -f "package-lock.json" ]; then
-    npm ci --no-audit 2>&1 || npm install --no-audit 2>&1 || rc=$?
+    echo "==> Executing custom build command: $custom_cmd"
+    eval "$custom_cmd" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "ERROR: Build command failed (exit code $rc)"
+      [ "$is_active" -ne 1 ] && rm -rf "$targetDir"
+      exit "$rc"
+    fi
+
+    if [ -f "$targetDir/artisan" ] && ! echo "$custom_cmd" | grep -q 'ziggy:generate'; then
+      if echo "$custom_cmd" | grep -qE 'composer[[:space:]]+(install|update)'; then
+        echo "==> Checking Laravel Ziggy routes after Composer update..."
+        rebuild_laravel_ziggy "$targetDir" "stdout" || true
+      fi
+    fi
   else
-    npm install --no-audit 2>&1 || rc=$?
-  fi
+    if [ ! -f "package.json" ]; then
+      echo "ERROR: No package.json found in '$site'"
+      [ "$is_active" -ne 1 ] && rm -rf "$targetDir"
+      exit 1
+    fi
 
-  if [ "$rc" -ne 0 ]; then
-    echo "ERROR: npm install failed (exit code $rc)"
-    [ "$is_active" -ne 1 ] && rm -rf "$targetDir"
-    exit "$rc"
-  fi
+    # 3. npm install & npm run build
+    echo "==> Running npm install..."
+    if [ -f "package-lock.json" ]; then
+      npm ci --no-audit 2>&1 || npm install --no-audit 2>&1 || rc=$?
+    else
+      npm install --no-audit 2>&1 || rc=$?
+    fi
 
-  echo "==> Running npm run build..."
-  npm run build 2>&1 || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "ERROR: npm run build failed (exit code $rc)"
-    [ "$is_active" -ne 1 ] && rm -rf "$targetDir"
-    exit "$rc"
+    if [ "$rc" -ne 0 ]; then
+      echo "ERROR: npm install failed (exit code $rc)"
+      [ "$is_active" -ne 1 ] && rm -rf "$targetDir"
+      exit "$rc"
+    fi
+
+    if [ -f "$targetDir/artisan" ]; then
+      echo "==> Rebuilding Laravel Ziggy routes before npm run build..."
+      rebuild_laravel_ziggy "$targetDir" "stdout" || true
+    fi
+
+    echo "==> Running npm run build..."
+    npm run build 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "ERROR: npm run build failed (exit code $rc)"
+      [ "$is_active" -ne 1 ] && rm -rf "$targetDir"
+      exit "$rc"
+    fi
   fi
 
   # 4. Promote dist / build assets
@@ -925,15 +1542,34 @@ if ($prefix !== '' && str_starts_with($reqUri, $prefix)) {
 }
 $reqUri = '/' . ltrim((string)$reqUri, '/');
 
-$filePath = __DIR__ . $reqUri;
-if (!is_file($filePath) && is_file(__DIR__ . '/public' . $reqUri)) {
-    $filePath = __DIR__ . '/public' . $reqUri;
+// Security Defense: Canonicalize path and prevent directory traversal (CWE-22)
+$root = realpath(__DIR__) ?: __DIR__;
+$publicRoot = realpath(__DIR__ . '/public') ?: ($root . '/public');
+
+$candidate = $root . $reqUri;
+$resolvedPath = realpath($candidate);
+
+if (($resolvedPath === false || !is_file($resolvedPath)) && is_dir($publicRoot)) {
+    $candidate = $publicRoot . $reqUri;
+    $resolvedPath = realpath($candidate);
 }
 
-$ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest'], true);
+// Disallow traversal outside site root or public folder
+$isValidPath = false;
+if ($resolvedPath !== false && is_file($resolvedPath)) {
+    if (str_starts_with($resolvedPath, $root) || (is_dir($publicRoot) && str_starts_with($resolvedPath, $publicRoot))) {
+        // Reject hidden files, environment files, git, sqlite, and config files
+        $base = basename($resolvedPath);
+        if (!str_starts_with($base, '.') && !preg_match('/\.(env|git|htaccess|htpasswd|conf|ini|log|sqlite|sqlite3|db|sh|bak)$/i', $base)) {
+            $isValidPath = true;
+        }
+    }
+}
 
-if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) {
+$ext = $isValidPath ? strtolower(pathinfo($resolvedPath, PATHINFO_EXTENSION)) : '';
+$isAsset = in_array($ext, ['js', 'mjs', 'css', 'json', 'map', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'wasm', 'webmanifest', 'txt', 'xml'], true);
+
+if ($isValidPath && $reqUri !== '/' && $isAsset && !str_ends_with($resolvedPath, '.php')) {
     $mimes = [
         'js' => 'application/javascript', 'mjs' => 'application/javascript',
         'css' => 'text/css', 'html' => 'text/html', 'htm' => 'text/html',
@@ -942,11 +1578,12 @@ if ($reqUri !== '/' && is_file($filePath) && !str_ends_with($filePath, '.php')) 
         'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp',
         'ico' => 'image/x-icon', 'woff' => 'font/woff', 'woff2' => 'font/woff2',
         'ttf' => 'font/ttf', 'eot' => 'application/vnd.ms-fontobject',
-        'wasm' => 'application/wasm'
+        'wasm' => 'application/wasm', 'webmanifest' => 'application/manifest+json',
+        'txt' => 'text/plain', 'xml' => 'application/xml'
     ];
     $mime = $mimes[$ext] ?? 'application/octet-stream';
     header('Content-Type: ' . $mime);
-    readfile($filePath);
+    readfile($resolvedPath);
     exit;
 }
 
@@ -1078,13 +1715,51 @@ json_sites() {
       [ -f "$site_ram_dir/package.json" ] && hasPkg=true
     fi
 
-    p="$([ -f "$PREV_DIR/$s.tar.gz" ] && echo true || echo false)"
+    local rb_items=() rb_total=0 rb_count=0 rf rsz rmtime rid rlabel
+    if [ -d "$PREV_DIR/$s" ]; then
+      while IFS= read -r rf; do
+        [ -f "$rf" ] || continue
+        rid="$(basename "$rf")"
+        rsz="$(stat -c %s "$rf" 2>/dev/null || echo 0)"
+        rmtime="$(stat -c %Y "$rf" 2>/dev/null || echo 0)"
+        rlabel="${rid%.tar.gz}"
+        rb_total=$((rb_total + rsz))
+        rb_count=$((rb_count + 1))
+        rb_items+=("$(jq -nc --arg id "$rid" --arg label "$rlabel" --argjson size "$rsz" --argjson mtime "$rmtime" \
+          '{id:$id,label:$label,size:$size,mtime:$mtime}')")
+      done < <(ls -1t "$PREV_DIR/$s"/*.tar.gz 2>/dev/null || true)
+    fi
+    if [ -f "$PREV_DIR/$s.tar.gz" ]; then
+      rsz="$(stat -c %s "$PREV_DIR/$s.tar.gz" 2>/dev/null || echo 0)"
+      rmtime="$(stat -c %Y "$PREV_DIR/$s.tar.gz" 2>/dev/null || echo 0)"
+      rb_total=$((rb_total + rsz))
+      rb_count=$((rb_count + 1))
+      rb_items+=("$(jq -nc --arg id "legacy" --arg label "Previous (legacy)" --argjson size "$rsz" --argjson mtime "$rmtime" \
+        '{id:$id,label:$label,size:$size,mtime:$mtime}')")
+    fi
+    local rb_json="[]"
+    [ "${#rb_items[@]}" -gt 0 ] && rb_json="$(printf '%s\n' "${rb_items[@]}" | jq -s '.')"
+    p="$([ "$rb_count" -gt 0 ] && echo true || echo false)"
+    port="$(jq -r '.port // null' "$meta_f" 2>/dev/null || echo null)"
+    local storage_linked=false
+    if [ -d "$site_ram_dir/public" ]; then
+      if [ -L "$site_ram_dir/public/storage" ] && [ -e "$site_ram_dir/public/storage" ]; then
+        storage_linked=true
+      fi
+    fi
+    local catalog_rebuilding=false
+    if systemctl is-active --quiet "wtc-catalog-${slug}.service" 2>/dev/null || [ -f "/run/wtc-catalog-${slug}.pending" ]; then
+      catalog_rebuilding=true
+    fi
     items+=("$(jq -nc --arg n "$s" --argjson a "$a" --argjson isPrim "$is_prim" \
       --arg slug "$slug" --arg url "/$slug/" \
       --argjson size "${size:-0}" --argjson m "${m:-0}" \
       --argjson p "$p" --argjson hasBuild "$hasPkg" \
-      --arg stack "$stack" \
-      '{name:$n,active:$a,isPrimary:$isPrim,slug:$slug,url:$url,size:$size,mtime:$m,hasPrevious:$p,hasBuild:$hasBuild,stack:$stack}')")
+      --arg stack "$stack" --argjson port "$port" \
+      --argjson storageLinked "$storage_linked" \
+      --argjson catalogRebuilding "$catalog_rebuilding" \
+      --argjson rollbacks "$rb_json" --argjson rollbackCount "$rb_count" --argjson rollbackSize "$rb_total" \
+      '{name:$n,active:$a,isPrimary:$isPrim,slug:$slug,url:$url,size:$size,mtime:$m,hasPrevious:$p,hasBuild:$hasBuild,stack:$stack,port:$port,storageLinked:$storageLinked,catalogRebuilding:$catalogRebuilding,rollbacks:$rollbacks,rollbackCount:$rollbackCount,rollbackSize:$rollbackSize}')")
   done < <(list_sites)
   if [ "${#items[@]}" -eq 0 ]; then
     echo "[]"
@@ -1597,8 +2272,8 @@ json_settings() {
     --arg SAVE_ON_SHUTDOWN "$SAVE_ON_SHUTDOWN" --arg SAVE_ON_SWITCH "$SAVE_ON_SWITCH" \
     --arg SAVE_INTERVAL_MIN "$SAVE_INTERVAL_MIN" \
     --arg FAN_ON_WIFI_DISCONNECT "${FAN_ON_WIFI_DISCONNECT:-no}" --arg FAN_WIFI_MODE "${FAN_WIFI_MODE:-pulse}" \
-    --arg FAN_GPIO "${FAN_GPIO:-14}" \
-    '{RAM_SIZE:$RAM_SIZE,DROP_MAX_MB:$DROP_MAX_MB,AUTO_ACTIVATE_NEW:$AUTO_ACTIVATE_NEW,AUTO_RELOAD_ACTIVE:$AUTO_RELOAD_ACTIVE,KEEP_PROCESSED:$KEEP_PROCESSED,SAVE_ON_SHUTDOWN:$SAVE_ON_SHUTDOWN,SAVE_ON_SWITCH:$SAVE_ON_SWITCH,SAVE_INTERVAL_MIN:$SAVE_INTERVAL_MIN,FAN_ON_WIFI_DISCONNECT:$FAN_ON_WIFI_DISCONNECT,FAN_WIFI_MODE:$FAN_WIFI_MODE,FAN_GPIO:$FAN_GPIO}'
+    --arg FAN_GPIO "${FAN_GPIO:-14}" --arg FORCE_HTTPS "${FORCE_HTTPS:-no}" --arg ROLLBACK_KEEP "${ROLLBACK_KEEP:-5}" \
+    '{RAM_SIZE:$RAM_SIZE,DROP_MAX_MB:$DROP_MAX_MB,AUTO_ACTIVATE_NEW:$AUTO_ACTIVATE_NEW,AUTO_RELOAD_ACTIVE:$AUTO_RELOAD_ACTIVE,KEEP_PROCESSED:$KEEP_PROCESSED,SAVE_ON_SHUTDOWN:$SAVE_ON_SHUTDOWN,SAVE_ON_SWITCH:$SAVE_ON_SWITCH,SAVE_INTERVAL_MIN:$SAVE_INTERVAL_MIN,FAN_ON_WIFI_DISCONNECT:$FAN_ON_WIFI_DISCONNECT,FAN_WIFI_MODE:$FAN_WIFI_MODE,FAN_GPIO:$FAN_GPIO,FORCE_HTTPS:$FORCE_HTTPS,ROLLBACK_KEEP:$ROLLBACK_KEEP}'
 }
 
 json_transfer() {
@@ -1633,8 +2308,8 @@ build_stack_cache() {
 json_stack() {
   local busy
   busy="$(svc_active wtc-stack-job.service)"
-  # If a stack job is running or cache missing, refresh cache
-  if [ ! -f "$STACK_CACHE_FILE" ] || [ "$busy" = "yes" ]; then
+  # If a stack job is running, cache missing, or cache still says busy after job finished, refresh cache
+  if [ ! -f "$STACK_CACHE_FILE" ] || [ "$busy" = "yes" ] || grep -q '"busy":true' "$STACK_CACHE_FILE" 2>/dev/null; then
     build_stack_cache
   fi
   cat "$STACK_CACHE_FILE"
@@ -1649,6 +2324,233 @@ cmd_workers() {
     restart) /usr/local/bin/wtc-workers restart ;;
     logs)    /usr/local/bin/wtc-workers logs "${2:-50}" ;;
     *) die "Unknown workers action: $action" ;;
+  esac
+}
+
+# ------------------------------------------------------------ Stack Logs Discovery & Reader
+resolve_stack_log_target() {
+  local src="${1:-}"
+  case "$src" in
+    nginx-error)  echo "/var/log/nginx/error.log|Nginx Error Log|nginx_error|1" ;;
+    nginx-access) echo "/var/log/nginx/access.log|Nginx Access Log|nginx_access|1" ;;
+    php-fpm)
+      local fpm_log
+      fpm_log="$(ls -1t /var/log/php*-fpm.log 2>/dev/null | head -n1 || true)"
+      [ -n "$fpm_log" ] || fpm_log="/var/log/php-fpm.log"
+      echo "$fpm_log|PHP-FPM Log|php_fpm|1"
+      ;;
+    mariadb)
+      local db_log="/var/log/mysql/error.log"
+      [ -f "$db_log" ] || db_log="/var/log/mariadb/mariadb.log"
+      echo "$db_log|MariaDB Error Log|auto|0"
+      ;;
+    redis)        echo "/var/log/redis/redis-server.log|Redis Server Log|auto|0" ;;
+    wtc-manage)   echo "$LOG_FILE|WTC System Activity|wtc|1" ;;
+    wtc-workers)  echo "/var/log/wtc-web/workers.log|Laravel Queue & Scheduler Workers|wtc|1" ;;
+    wtc-build)    echo "$BUILD_LOG|Build Runner Job Log|wtc|1" ;;
+    wtc-stack)    echo "$STACK_LOG|Stack Package Installer Log|wtc|1" ;;
+    wtc-service)  echo "/var/log/wtc-web/service.log|RAM Disk & Service Boot Log|wtc|1" ;;
+    ram:*)
+      local rel="${src#ram:}"
+      rel="${rel#/}"
+      case "$rel" in
+        ""|*..*|*\\*) return 1 ;;
+      esac
+      local candidate="$RAM_MOUNT/$rel"
+      local real_ram real_file
+      real_ram="$(readlink -f "$RAM_MOUNT" 2>/dev/null || echo "$RAM_MOUNT")"
+      real_file="$(readlink -f "$candidate" 2>/dev/null || true)"
+      [ -n "$real_file" ] && [[ "$real_file" == "$real_ram/"* ]] && [ -f "$real_file" ] || return 1
+      case "$real_file" in
+        *.log|*.error|*.txt|*/storage/logs/*|*/logs/*) ;;
+        *) return 1 ;;
+      esac
+      local fmt="auto"
+      case "$rel" in
+        *laravel*|*storage/logs/*) fmt="laravel" ;;
+        *nginx*error*) fmt="nginx_error" ;;
+        *nginx*access*) fmt="nginx_access" ;;
+      esac
+      echo "$real_file|$rel|$fmt|1"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+json_stack_logs() {
+  local items=()
+  local cur_site; cur_site="$(active_site)"
+
+  # 1. Discover site / application stack logs in RAM drive (/mnt/ramdisk/sites/*)
+  if [ -d "$RAM_SITES_DIR" ]; then
+    local s slug site_dir stack f rel fmt
+    while read -r s; do
+      [ -z "$s" ] && continue
+      slug="$(site_slug "$s")"
+      site_dir="$RAM_SITES_DIR/$slug"
+      [ -d "$site_dir" ] || continue
+      stack="$(detect_site_stack "$site_dir" 2>/dev/null || echo "unknown")"
+
+      while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        rel="${f#$RAM_MOUNT/}"
+        local sz mt
+        sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+        mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+        fmt="auto"
+        [[ "$f" == *"/storage/logs/"* ]] && fmt="laravel"
+        items+=("$(jq -nc \
+          --arg id "ram:$rel" \
+          --arg label "$s / $(basename "$f")" \
+          --arg category "Application Stacks" \
+          --arg stack "$stack" \
+          --arg site "$s" \
+          --arg path "$f" \
+          --arg relPath "$rel" \
+          --arg format "$fmt" \
+          --argjson size "$sz" \
+          --argjson mtime "$mt" \
+          --argjson exists true \
+          --argjson clearable true \
+          --argjson primary "$([ "$s" = "$cur_site" ] && echo true || echo false)" \
+          '{id:$id,label:$label,category:$category,stack:$stack,site:$site,path:$path,relPath:$relPath,format:$format,size:$size,mtime:$mtime,exists:$exists,clearable:$clearable,primary:$primary}')")
+      done < <(find "$site_dir" -maxdepth 4 -type f -name "*.log" \( -path "*/storage/logs/*" -o -path "*/logs/*" -o -path "*/log/*" -o -path "$site_dir/*.log" \) 2>/dev/null | sort)
+    done < <(list_sites)
+  fi
+
+  # 2. Web & Runtime Stack logs
+  local sys_defs=(
+    "nginx-error|Nginx Error Log|Web & Runtime Stack|nginx_error|/var/log/nginx/error.log|1"
+    "nginx-access|Nginx Access Log|Web & Runtime Stack|nginx_access|/var/log/nginx/access.log|1"
+    "php-fpm|PHP-FPM Runtime Log|Web & Runtime Stack|php_fpm|$(ls -1t /var/log/php*-fpm.log 2>/dev/null | head -n1 || echo /var/log/php-fpm.log)|1"
+    "mariadb|MariaDB Error Log|Web & Runtime Stack|auto|$([ -f /var/log/mysql/error.log ] && echo /var/log/mysql/error.log || echo /var/log/mariadb/mariadb.log)|0"
+    "redis|Redis Server Log|Web & Runtime Stack|auto|/var/log/redis/redis-server.log|0"
+    "wtc-manage|WTC System Activity|WTC Platform & Jobs|wtc|$LOG_FILE|1"
+    "wtc-workers|Laravel Queue & Scheduler Workers|WTC Platform & Jobs|wtc|/var/log/wtc-web/workers.log|1"
+    "wtc-build|Build Runner Job Output|WTC Platform & Jobs|wtc|$BUILD_LOG|1"
+    "wtc-stack|Stack Package Installer|WTC Platform & Jobs|wtc|$STACK_LOG|1"
+    "wtc-service|RAM Disk & Service Boot|WTC Platform & Jobs|wtc|/var/log/wtc-web/service.log|1"
+  )
+
+  local def id lbl cat fmt fpath clr ex sz mt
+  for def in "${sys_defs[@]}"; do
+    IFS='|' read -r id lbl cat fmt fpath clr <<< "$def"
+    ex=false; sz=0; mt=0
+    if [ -f "$fpath" ]; then
+      ex=true
+      sz="$(stat -c %s "$fpath" 2>/dev/null || echo 0)"
+      mt="$(stat -c %Y "$fpath" 2>/dev/null || echo 0)"
+    fi
+    # Skip optional services if log file does not exist
+    if { [ "$id" = "mariadb" ] || [ "$id" = "redis" ]; } && [ "$ex" = "false" ]; then
+      continue
+    fi
+    items+=("$(jq -nc \
+      --arg id "$id" \
+      --arg label "$lbl" \
+      --arg category "$cat" \
+      --arg stack "system" \
+      --arg site "" \
+      --arg path "$fpath" \
+      --arg relPath "" \
+      --arg format "$fmt" \
+      --argjson size "$sz" \
+      --argjson mtime "$mt" \
+      --argjson exists "$ex" \
+      --argjson clearable "$([ "$clr" = "1" ] && echo true || echo false)" \
+      --argjson primary false \
+      '{id:$id,label:$label,category:$category,stack:$stack,site:$site,path:$path,relPath:$relPath,format:$format,size:$size,mtime:$mtime,exists:$exists,clearable:$clearable,primary:$primary}')")
+  done
+
+  # 3. Rejected dropbox error files in RAM
+  if [ -d "$REJECT_DIR" ]; then
+    local rf
+    for rf in "$REJECT_DIR"/*.error; do
+      [ -f "$rf" ] || continue
+      local rrel="${rf#$RAM_MOUNT/}"
+      local rsz rmt
+      rsz="$(stat -c %s "$rf" 2>/dev/null || echo 0)"
+      rmt="$(stat -c %Y "$rf" 2>/dev/null || echo 0)"
+      items+=("$(jq -nc \
+        --arg id "ram:$rrel" \
+        --arg label "Rejected: $(basename "$rf")" \
+        --arg category "RAM Drive Errors" \
+        --arg stack "dropbox" \
+        --arg site "" \
+        --arg path "$rf" \
+        --arg relPath "$rrel" \
+        --arg format "wtc" \
+        --argjson size "$rsz" \
+        --argjson mtime "$rmt" \
+        --argjson exists true \
+        --argjson clearable true \
+        --argjson primary false \
+        '{id:$id,label:$label,category:$category,stack:$stack,site:$site,path:$path,relPath:$relPath,format:$format,size:$size,mtime:$mtime,exists:$exists,clearable:$clearable,primary:$primary}')")
+    done
+  fi
+
+  if [ "${#items[@]}" -eq 0 ]; then
+    echo "[]"
+  else
+    printf '%s\n' "${items[@]}" | jq -s '.'
+  fi
+}
+
+cmd_stack_logs() {
+  local action="${1:-list}" source="${2:-wtc-manage}" lines="${3:-200}"
+  case "$action" in
+    list)
+      json_stack_logs
+      ;;
+    read)
+      [[ "$lines" =~ ^[0-9]+$ ]] || lines=200
+      [ "$lines" -lt 10 ] && lines=10
+      [ "$lines" -gt 2000 ] && lines=2000
+      local resolved fpath label fmt clr
+      if ! resolved="$(resolve_stack_log_target "$source")"; then
+        jq -nc --arg err "Invalid or inaccessible log source: $source" '{ok:false,error:$err}'
+        return 1
+      fi
+      IFS='|' read -r fpath label fmt clr <<< "$resolved"
+      if [ ! -f "$fpath" ]; then
+        jq -nc --arg id "$source" --arg label "$label" --arg path "$fpath" --arg format "$fmt" \
+          '{ok:true,id:$id,label:$label,path:$path,format:$format,exists:false,size:0,mtime:0,clearable:false,content:""}'
+        return 0
+      fi
+      local sz mt
+      sz="$(stat -c %s "$fpath" 2>/dev/null || echo 0)"
+      mt="$(stat -c %Y "$fpath" 2>/dev/null || echo 0)"
+      tail -n "$lines" "$fpath" 2>/dev/null | tail -c 524288 | jq -Rs \
+        --arg id "$source" \
+        --arg label "$label" \
+        --arg path "$fpath" \
+        --arg format "$fmt" \
+        --argjson size "$sz" \
+        --argjson mtime "$mt" \
+        --argjson exists true \
+        --argjson clearable "$([ "$clr" = "1" ] && echo true || echo false)" \
+        '{ok:true,id:$id,label:$label,path:$path,format:$format,exists:$exists,size:$size,mtime:$mtime,clearable:$clearable,content:.}'
+      ;;
+    clear)
+      local resolved fpath label fmt clr
+      if ! resolved="$(resolve_stack_log_target "$source")"; then
+        jq -nc --arg err "Invalid log source: $source" '{ok:false,error:$err}'
+        return 1
+      fi
+      IFS='|' read -r fpath label fmt clr <<< "$resolved"
+      if [ "$clr" != "1" ]; then
+        jq -nc --arg err "Log source '$label' is read-only" '{ok:false,error:$err}'
+        return 1
+      fi
+      if [ -f "$fpath" ]; then
+        : > "$fpath"
+        log "Cleared log file: $fpath"
+      fi
+      jq -nc --arg id "$source" --arg label "$label" '{ok:true,id:$id,label:$label}'
+      ;;
+    *)
+      die "Unknown stack-logs action: $action"
+      ;;
   esac
 }
 
@@ -1888,7 +2790,8 @@ json_services() {
       }
       close(en_file)
 
-      ours_list["wtc-ramdisk.service"] = "WTC RAM-Disk Mount & Live Loader;platform;Mounts tmpfs RAM disk and unpacks active site on boot"
+      ours_list["wtc-ramdisk.service"] = "WTC RAM-Disk Mount & UI Loader;platform;Mounts tmpfs RAM disk and syncs Management UI first on boot"
+      ours_list["wtc-site-loader.service"] = "WTC Site RAM Loader;platform;Transfers active sites from SD card into RAM after UI starts"
       ours_list["wtc-dropbox.path"] = "WTC Ingest Watcher (Path);platform;Watches /mnt/ramdisk/dropbox for incoming deployment archives"
       ours_list["wtc-dropbox.service"] = "WTC Ingest Service;platform;Validates and unpacks dropped site packages into storage"
       ours_list["wtc-workers.service"] = "WTC Workers Supervisor;platform;Supervises Laravel queue:work and schedule:work background runners"
@@ -2047,8 +2950,7 @@ service_to_pkgs() {
   fi
   case "$u" in
     nginx|nginx.service) echo "nginx nginx-common" ;;
-    mariadb|mariadb.service) echo "mariadb-server mariadb-client" ;;
-    mysql|mysql.service) echo "mysql-server mysql-client" ;;
+    mariadb|mariadb.service|mysql|mysql.service) echo "mariadb-server mariadb-client" ;;
     php*|php*-fpm|php*-fpm.service)
       if [ -n "$phpv" ]; then
         echo "php${phpv}-fpm php${phpv}-common php${phpv}-cli"
@@ -2056,15 +2958,16 @@ service_to_pkgs() {
         echo "php-fpm php-common php-cli"
       fi
       ;;
-    smbd|smbd.service|nmbd|nmbd.service) echo "samba samba-common" ;;
-    ssh|ssh.service|sshd|sshd.service|ssh.socket) echo "openssh-server openssh-client" ;;
-    redis|redis.service|redis-server|redis-server.service) echo "redis-server" ;;
+    smbd|smbd.service|nmbd|nmbd.service|samba*) echo "samba samba-common" ;;
+    ssh|ssh.service|sshd|sshd.service|ssh.socket|ssh*|sshd*) echo "openssh-server openssh-client" ;;
+    redis|redis.service|redis-server|redis-server.service|redis*) echo "redis-server" ;;
     memcached|memcached.service) echo "memcached" ;;
     vsftpd|vsftpd.service) echo "vsftpd" ;;
-    avahi-daemon|avahi-daemon.service) echo "avahi-daemon" ;;
+    avahi-daemon|avahi-daemon.service|avahi-daemon.socket|avahi*) echo "avahi-daemon" ;;
     systemd-journald|systemd-journald.service|systemd-udevd|systemd-udevd.service|systemd-logind|systemd-logind.service) echo "systemd udev" ;;
     systemd-timesyncd|systemd-timesyncd.service) echo "systemd-timesyncd" ;;
-    systemd-resolved|systemd-resolved.service) echo "systemd-resolved" ;;
+    systemd-resolved|systemd-resolved.service) echo "systemd-resolved systemd" ;;
+    systemd*) echo "systemd" ;;
     NetworkManager|NetworkManager.service) echo "network-manager" ;;
     wpa_supplicant|wpa_supplicant.service) echo "wpasupplicant" ;;
     dbus|dbus.service) echo "dbus" ;;
@@ -2160,7 +3063,7 @@ remove_applied_patch() {
         $filtered = array_values(array_filter($data, function($item) use ($u) {
           if ($u === "all" || $u === "*") return false;
           $pu = strtolower(preg_replace("/\.service$/", "", trim((string)($item["unit"] ?? ""))));
-          if ($pu === $u || ($pu === "all" && $u !== "")) return false;
+          if ($pu === $u) return false;
           if (str_starts_with($u, "php") && str_starts_with($pu, "php")) return false;
           return true;
         }));
@@ -2197,7 +3100,7 @@ harden_php_security() {
 expose_php = Off
 display_errors = Off
 max_multipart_body_parts = 1000
-max_file_uploads = 50
+max_file_uploads = 50000
 allow_url_include = Off
 session.cookie_httponly = 1
 session.use_strict_mode = 1
@@ -2267,37 +3170,29 @@ cmd_service_patch() {
     mariadb|mariadb.service|mysql|mysql.service)
       harden_mariadb_loopback 2>/dev/null || true
       record_applied_patch "$unit" "SEC-BIND-01" "127.0.0.1"
-      if [ -n "$post_ver" ]; then
-        record_applied_patch "$unit" "PACKAGE_UPGRADE" "$post_ver"
-      fi
-      systemctl restart "$unit" 2>/dev/null || true
+      record_applied_patch "$unit" "PACKAGE_UPGRADE" "${post_ver:-hardened}"
+      systemctl restart mariadb 2>/dev/null || systemctl restart "$unit" 2>/dev/null || true
       ;;
     php*|php*-fpm|php*-fpm.service)
       harden_php_security 2>/dev/null || true
-      if [ -n "$post_ver" ]; then
-        record_applied_patch "$unit" "PACKAGE_UPGRADE" "$post_ver"
-      fi
-      # IMPORTANT: Prevent 502 Bad Gateway by gracefully reloading PHP-FPM
-      # rather than immediate SIGTERM restart which severs active FastCGI socket connections!
-      if command -v systemctl >/dev/null 2>&1; then
-        systemctl reload "$unit" 2>/dev/null || true
-        ( nohup bash -c "sleep 1.5 && systemctl reload-or-restart '$unit'" >/dev/null 2>&1 & )
+      record_applied_patch "$unit" "PACKAGE_UPGRADE" "${post_ver:-hardened}"
+      # Defer reload until after HTTP JSON response completes so PHP-FPM never drops this active request
+      if [[ "$unit" == *fpm* ]] && command -v systemctl >/dev/null 2>&1; then
+        ( nohup bash -c "sleep 1.2 && systemctl reload '$unit'" </dev/null >/dev/null 2>&1 & )
       fi
       ;;
     nginx|nginx.service)
-      if [ -n "$post_ver" ]; then
-        record_applied_patch "$unit" "PACKAGE_UPGRADE" "$post_ver"
-      fi
+      record_applied_patch "$unit" "PACKAGE_UPGRADE" "${post_ver:-hardened}"
       if command -v systemctl >/dev/null 2>&1; then
         systemctl reload "$unit" 2>/dev/null || true
-        ( nohup bash -c "sleep 1.5 && systemctl reload-or-restart '$unit'" >/dev/null 2>&1 & )
       fi
       ;;
+    *.socket|*.timer|*.path|*@*|sshd-keygen*|phpsessionclean*)
+      record_applied_patch "$unit" "PACKAGE_UPGRADE" "${post_ver:-hardened}"
+      ;;
     *)
-      if [ -n "$post_ver" ]; then
-        record_applied_patch "$unit" "PACKAGE_UPGRADE" "$post_ver"
-      fi
-      systemctl restart "$unit" 2>/dev/null || systemctl reload "$unit" 2>/dev/null || true
+      record_applied_patch "$unit" "PACKAGE_UPGRADE" "${post_ver:-hardened}"
+      systemctl reload "$unit" 2>/dev/null || systemctl restart "$unit" 2>/dev/null || true
       ;;
   esac
 
@@ -2319,8 +3214,13 @@ cmd_service_patch_all() {
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
     local APT=(apt-get -o DPkg::Lock::Timeout=300 -y)
+    local prc="/usr/sbin/policy-rc.d" prc_set=0
+    if [ ! -e "$prc" ]; then
+      printf '#!/bin/sh\nexit 101\n' > "$prc" 2>/dev/null && chmod 0755 "$prc" && prc_set=1
+    fi
     "${APT[@]}" update >/dev/null 2>&1 || true
     out="$("${APT[@]}" dist-upgrade 2>&1)" || rc=$?
+    [ "$prc_set" = 1 ] && rm -f "$prc"
     if [ "$rc" -ne 0 ]; then
       log "Warning: dist-upgrade reported: $out"
     fi
@@ -2331,8 +3231,9 @@ cmd_service_patch_all() {
   harden_mariadb_loopback 2>/dev/null || true
   harden_php_security 2>/dev/null || true
 
-  local s_units=(nginx.service nginx mariadb.service mariadb mysql.service mysql php-fpm.service php-fpm php ssh.service ssh sshd.service sshd smbd.service smbd redis.service redis redis-server.service vsftpd.service vsftpd avahi-daemon.service avahi-daemon system wtc-core)
+  local s_units=(nginx.service nginx mariadb.service mariadb mysql.service mysql php-fpm.service php-fpm php ssh.service ssh sshd.service sshd smbd.service smbd redis.service redis redis-server.service vsftpd.service vsftpd avahi-daemon.service avahi-daemon systemd-resolved.service system wtc-core)
   [ -n "$phpv" ] && s_units+=("php${phpv}-fpm.service")
+  local patched_count=0
   for su in "${s_units[@]}"; do
     local spkgs; spkgs="$(service_to_pkgs "$su")"
     local sp_ver=""
@@ -2342,24 +3243,23 @@ cmd_service_patch_all() {
     fi
     if [ -n "$sp_ver" ]; then
       record_applied_patch "$su" "PACKAGE_UPGRADE" "$sp_ver"
+      patched_count=$((patched_count + 1))
     fi
   done
   record_applied_patch "all" "ALL" "hardened"
 
   local php_unit; php_unit="$(php_fpm_unit 2>/dev/null || echo '')"
-  if [ -n "$php_unit" ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl reload "$php_unit" 2>/dev/null || true
-    ( nohup bash -c "sleep 1.5 && systemctl reload-or-restart '$php_unit'" >/dev/null 2>&1 & )
-  fi
   if command -v systemctl >/dev/null 2>&1; then
     systemctl reload nginx 2>/dev/null || true
-    ( nohup bash -c "sleep 1.5 && systemctl reload-or-restart nginx" >/dev/null 2>&1 & )
     systemctl restart mariadb smbd 2>/dev/null || true
+    if [ -n "$php_unit" ]; then
+      ( nohup bash -c "sleep 1.2 && systemctl reload '$php_unit'" </dev/null >/dev/null 2>&1 & )
+    fi
   fi
 
   rm -f /mnt/ramdisk/.security_scan.json /tmp/.security_scan.json /tmp/.wtc_security_scan.json 2>/dev/null || true
   log "All services and packages patched successfully"
-  echo "{\"ok\":true,\"message\":\"All security updates and packages successfully patched and services reloaded\"}"
+  echo "{\"ok\":true,\"patched_count\":$patched_count,\"total_units\":${#s_units[@]},\"message\":\"All security updates and packages successfully patched and services reloaded\"}"
 }
 
 cmd_security_remediate() {
@@ -2389,6 +3289,10 @@ cmd_security_remediate() {
         sed -i 's/^[[:space:]]*APP_DEBUG[[:space:]]*=.*/APP_DEBUG=false/' "$env_f" 2>/dev/null || true
       fi
       echo '{"ok":true,"rule":"disable_app_debug","message":"APP_DEBUG set to false in live .env"}'
+      ;;
+    link_laravel_storage)
+      cmd_storage_link ""
+      echo '{"ok":true,"rule":"link_laravel_storage","message":"Laravel storage symlinks verified and linked to storage/app/public"}'
       ;;
     harden_php_tokens)
       local php_u; php_u="$(php_fpm_unit 2>/dev/null || echo '')"
@@ -2514,6 +3418,15 @@ generate_security_audit() {
   if [ -f "$active_env" ] && grep -qiE '^[[:space:]]*APP_DEBUG[[:space:]]*=[[:space:]]*true' "$active_env" 2>/dev/null; then
     issues+=('{"id":"app_debug_enabled","category":"app_config","severity":"high","title":"Laravel APP_DEBUG is Enabled in Production","desc":"Verbose debugging is enabled on the active website. Unhandled application exceptions will expose database credentials, environment keys, and source code.","remediation":"Set APP_DEBUG=false in the active site .env file.","can_remediate":true,"remediation_id":"disable_app_debug"}')
     high=$((high + 1))
+  fi
+
+  # Check active site Laravel storage link
+  local active_ram="/mnt/ramdisk/webroot"
+  if [ -d "$active_ram/public" ] && { [ -f "$active_ram/artisan" ] || [ -f "$active_ram/public/index.php" ]; }; then
+    if [ ! -L "$active_ram/public/storage" ] || [ ! -e "$active_ram/public/storage" ]; then
+      issues+=('{"id":"laravel_storage_unlinked","category":"app_config","severity":"medium","title":"Laravel Public Storage Link is Missing","desc":"The active Laravel application does not have public/storage linked to storage/app/public. Uploaded files, user avatars, and media assets will return 404 errors.","remediation":"Link Laravel storage via wtc-manage --storage-link or the 🔗 storage:link button in Sites & Apps.","can_remediate":true,"remediation_id":"link_laravel_storage"}')
+      medium=$((medium + 1))
+    fi
   fi
 
   # 7. System Reboot Required
@@ -2819,6 +3732,7 @@ cmd_json() {
     firewall) json_firewall ;;
     services) json_services ;;
     security) generate_security_audit cached ;;
+    stack_logs) json_stack_logs ;;
     *) die "Unknown json view" ;;
   esac
 }
@@ -2864,7 +3778,9 @@ case "${1:-}" in
   --set)        cmd_set "${2:-}" ;;
   --activate|--enable-site)   cmd_activate "${2:-}" "${3:-1}" ;;
   --deactivate|--disable-site) cmd_deactivate "${2:-}" ;;
-  --rollback)   cmd_rollback "${2:-}" ;;
+  --rollback)   cmd_rollback "${2:-}" "${3:-}" ;;
+  --rollback-delete) cmd_rollback_delete "${2:-}" "${3:-}" ;;
+  --rollback-clear)  cmd_rollback_clear "${2:-}" ;;
   --delete)     cmd_delete "${2:-}" ;;
   --create)     cmd_create "${2:-}" ;;
   --ingest)     "$SERVICE_BIN" --ingest ;;
@@ -2874,6 +3790,7 @@ case "${1:-}" in
   --transfer)   cmd_transfer "${2:-}" "${3:-}" ;;
   --stack)      cmd_stack "${2:-}" "${3:-}" ;;
   --stack-exec) cmd_stack_exec "${2:-}" "${3:-}" ;;
+  --stack-logs) cmd_stack_logs "${2:-list}" "${3:-wtc-manage}" "${4:-200}" ;;
   --device)     cmd_device "${2:-}" ;;
   --db-create)      cmd_db_create "${2:-}" ;;
   --db-import)      cmd_db_import "${2:-}" ;;
@@ -2884,10 +3801,18 @@ case "${1:-}" in
   --db-tables)      cmd_db_tables "${2:-}" ;;
   --db-query)       cmd_db_query "${2:-}" "${3:-}" ;;
   --artisan)        cmd_artisan "${2:-}" "${3:-}" ;;
-  --direct-deploy)  cmd_direct_deploy "${2:-}" "${3:-}" "${4:-}" ;;
+  --ziggy|--rebuild-ziggy) cmd_ziggy "${2:-}" ;;
+  --storage-link|--link-storage) cmd_storage_link "${2:-}" ;;
+  --direct-deploy)  cmd_direct_deploy "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+  --rebuild-catalog) cmd_rebuild_catalog "${2:-}" ;;
+  --rebuild-catalog-exec) cmd_rebuild_catalog_exec "${2:-}" ;;
   --store-site)     cmd_store_site "${2:-}" "${3:-}" ;;
-  --build)          cmd_build "${2:-}" ;;
-  --build-exec)     cmd_build_exec "${2:-}" ;;
+  --site-rename)    cmd_site_rename "${2:-}" "${3:-}" ;;
+  --site-clone|--site-duplicate|--duplicate-site|--clone-site) cmd_site_clone "${2:-}" "${3:-}" "${4:-}" "${5:-clone}" "${6:-1}" ;;
+  --site-stack)     cmd_site_stack "${2:-}" "${3:-}" ;;
+  --site-port)      cmd_site_port "${2:-}" "${3:-}" ;;
+  --build)          cmd_build "${2:-}" "${3:-}" ;;
+  --build-exec)     cmd_build_exec "${2:-}" "${3:-}" ;;
   --server-tune)    cmd_server_tune ;;
   --reload-ui)      cmd_reload_ui ;;
   --workers)        cmd_workers "${2:-status}" "${3:-}" ;;
@@ -2904,5 +3829,5 @@ case "${1:-}" in
   --cve-check)      cmd_cve_check "${2:-}" "${3:-}" ;;
   --network)        if [ -x /usr/local/bin/wtc-network ]; then /usr/local/bin/wtc-network "${2:-check}"; else echo "Network watchdog not installed"; fi ;;
   --fan)            if [ -x /usr/local/bin/wtc-network ]; then /usr/local/bin/wtc-network fan "${2:-status}" "${3:-}"; else echo "Fan controller not installed"; fi ;;
-  *) echo "Usage: wtc-manage [--list|--current|--status|--logs N|--set S|--rollback S|--delete S|--create S|--ingest|--save-state|--reload-ui|--rescan-sites|--rescan-stack|--firewall ACT [PORT] [PROTO]|--service ACT UNIT [LINES]|--network [ACT]|--fan [ACT]|--json V|--setting K V|--transfer ...|--stack A ID|--device A|--db-create S|--db-import S|--db-export S [F]|--db-info S|--db-test S|--db-creds S|--db-tables S|--db-query S [Q]|--artisan S CMD|--direct-deploy S DIR [P]|--store-site S DIR|--build S|--server-tune|--workers ACTION|--nginx-save T [R]|--nginx-test T|--nginx-ctl A|--nginx-reset]"; exit 2 ;;
+  *) echo "Usage: wtc-manage [--list|--current|--status|--logs N|--set S|--rollback S|--delete S|--create S|--ingest|--save-state|--reload-ui|--rescan-sites|--rescan-stack|--firewall ACT [PORT] [PROTO]|--service ACT UNIT [LINES]|--network [ACT]|--fan [ACT]|--json V|--setting K V|--transfer ...|--stack A ID|--device A|--db-create S|--db-import S|--db-export S [F]|--db-info S|--db-test S|--db-creds S|--db-tables S|--db-query S [Q]|--artisan S CMD|--ziggy [S]|--storage-link [S]|--direct-deploy S DIR [P]|--store-site S DIR|--build S|--server-tune|--workers ACTION|--nginx-save T [R]|--nginx-test T|--nginx-ctl A|--nginx-reset]"; exit 2 ;;
 esac

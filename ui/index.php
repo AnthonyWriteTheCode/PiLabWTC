@@ -5,13 +5,13 @@ declare(strict_types=1);
 
 const AUTH_FILE = '/etc/wtc-web/ui-auth';
 const DROP_DIR = '/mnt/ramdisk/dropbox';
-const STAGE_DIR = '/mnt/ramdisk/php-tmp/staging';
+const STAGE_DIR = '/var/tmp/wtc-staging';
 const SITES_DIR = '/opt/wtc-web/sites';
-const MAX_UPLOAD = 1024 * 1024 * 1024; // 1GB
+const MAX_UPLOAD = 10 * 1024 * 1024 * 1024; // 10GB (supports large multi-GB sites & 400k files)
 
-@ini_set('memory_limit', '512M');
-@ini_set('max_execution_time', '600');
-@ini_set('max_input_time', '600');
+@ini_set('memory_limit', '2048M');
+@ini_set('max_execution_time', '3600');
+@ini_set('max_input_time', '3600');
 
 require_once __DIR__ . '/components/stacks.php';
 require_once __DIR__ . '/components/db_helper.php';
@@ -126,18 +126,33 @@ function site_host(): string
     return 'localhost';
 }
 
+function site_scheme(): string
+{
+    static $scheme = null;
+    if ($scheme !== null) {
+        return $scheme;
+    }
+    $set = wj('settings');
+    $scheme = (($set['FORCE_HTTPS'] ?? 'no') === 'yes') ? 'https' : 'http';
+    return $scheme;
+}
+
 function site_url(string $path = '/'): string
 {
     $host = site_host();
     $path = '/' . ltrim($path, '/');
-    return 'http://' . $host . $path;
+    return site_scheme() . '://' . $host . $path;
 }
 
 function site_port_url(int $port = 8080, string $path = '/'): string
 {
     $host = site_host();
     $path = '/' . ltrim($path, '/');
-    return 'http://' . $host . ':' . $port . $path;
+    $scheme = site_scheme();
+    if ($port === 8080 && $scheme === 'https') {
+        return 'https://' . $host . $path;
+    }
+    return $scheme . '://' . $host . ':' . $port . $path;
 }
 
 function csrf(): string
@@ -166,13 +181,23 @@ function safe_php_extract(string $archiveFile, string $destDir, string $rawName)
     }
 
     if (preg_match('/\.zip$/i', $rawName)) {
-        $zip = new ZipArchive();
-        if ($zip->open($archiveFile) !== true) {
-            exec('/usr/bin/unzip -qo ' . escapeshellarg($archiveFile) . ' -d ' . escapeshellarg($destDir), $uOut, $uRc);
+        // Fast streaming extraction & ZipSlip pre-audit via system unzip (written in C, no PHP memory overhead)
+        $unzipBin = is_executable('/usr/bin/unzip') ? '/usr/bin/unzip' : (is_executable('/bin/unzip') ? '/bin/unzip' : null);
+        if ($unzipBin) {
+            $chkCmd = $unzipBin . ' -Z1 ' . escapeshellarg($archiveFile) . ' 2>/dev/null | grep -E "(^|/)\.\.(/|$)|^\/|^\\\\" | head -n 1';
+            $badPath = trim((string) exec($chkCmd, $chkOut, $chkRc));
+            if ($badPath !== '') {
+                throw new RuntimeException("Archive rejected: Malicious path traversal ('$badPath') detected in zip archive.");
+            }
+            exec($unzipBin . ' -qo ' . escapeshellarg($archiveFile) . ' -d ' . escapeshellarg($destDir), $uOut, $uRc);
             if ($uRc !== 0) {
                 throw new RuntimeException('Failed to extract zip archive');
             }
         } else {
+            $zip = new ZipArchive();
+            if ($zip->open($archiveFile) !== true) {
+                throw new RuntimeException('Failed to open zip archive');
+            }
             // Pre-audit: Reject ZipSlip
             for ($i = 0; $i < $zip->numFiles; $i++) {
                 $stat = $zip->statIndex($i);
@@ -186,15 +211,11 @@ function safe_php_extract(string $archiveFile, string $destDir, string $rawName)
             $zip->close();
         }
     } else {
-        // Tar archive: check listing
-        exec('/bin/tar -tf ' . escapeshellarg($archiveFile) . ' 2>/dev/null', $listOut, $listRc);
-        if ($listRc === 0 && !empty($listOut)) {
-            foreach ($listOut as $line) {
-                $line = trim($line);
-                if (str_contains($line, '../') || str_starts_with($line, '/')) {
-                    throw new RuntimeException("Archive rejected: Malicious path traversal ('$line') detected in tar archive.");
-                }
-            }
+        // Tar archive: streaming ZipSlip check without buffering 400,000 lines into PHP memory
+        $chkCmd = '/bin/tar -tf ' . escapeshellarg($archiveFile) . ' 2>/dev/null | grep -E "(^|/)\.\.(/|$)|^\/" | head -n 1';
+        $badPath = trim((string) exec($chkCmd, $chkOut, $chkRc));
+        if ($badPath !== '') {
+            throw new RuntimeException("Archive rejected: Malicious path traversal ('$badPath') detected in tar archive.");
         }
         exec('/bin/tar -xf ' . escapeshellarg($archiveFile) . ' -C ' . escapeshellarg($destDir) . ' --no-same-owner --no-same-permissions', $tOut, $tRc);
         if ($tRc !== 0) {
@@ -202,27 +223,23 @@ function safe_php_extract(string $archiveFile, string $destDir, string $rawName)
         }
     }
 
-    // Post-audit: Remove any dangerous symlinks pointing outside destDir
+    // Post-audit: Remove any dangerous symlinks pointing outside destDir.
+    // Uses native C find to locate symlinks only - prevents traversing 400,000 files in PHP userland.
     $realDest = realpath($destDir) ?: $destDir;
     if (is_dir($destDir)) {
-        try {
-            $iterator = new RecursiveIteratorIterator(
-                new RecursiveDirectoryIterator($destDir, FilesystemIterator::SKIP_DOTS),
-                RecursiveIteratorIterator::CHILD_FIRST
-            );
-            foreach ($iterator as $item) {
-                if ($item->isLink()) {
-                    $linkTarget = @readlink($item->getPathname());
-                    $resolved = @realpath($item->getPathname());
-                    if ($linkTarget !== false) {
-                        if (str_starts_with($linkTarget, '/') || !$resolved || !str_starts_with($resolved, $realDest)) {
-                            @unlink($item->getPathname());
-                        }
+        exec('/usr/bin/find ' . escapeshellarg($destDir) . ' -type l 2>/dev/null', $symlinks, $findRc);
+        if ($findRc === 0 && !empty($symlinks)) {
+            foreach ($symlinks as $linkPath) {
+                $linkPath = trim((string) $linkPath);
+                if ($linkPath === '') continue;
+                $linkTarget = @readlink($linkPath);
+                $resolved = @realpath($linkPath);
+                if ($linkTarget !== false) {
+                    if (str_starts_with($linkTarget, '/') || !$resolved || !str_starts_with($resolved, $realDest)) {
+                        @unlink($linkPath);
                     }
                 }
             }
-        } catch (Throwable $e) {
-            // Directory iterator error fallback
         }
     }
 }
@@ -303,11 +320,45 @@ function parse_ignore_patterns(string $filePath): array
 }
 
 /**
+ * Seed $stageDir with the existing site's files (from live RAM or stored .tar.gz)
+ * so incremental uploads can safely overlay only recently modified files.
+ */
+function seed_stage_from_existing(string $siteName, string $stageDir): bool
+{
+    $slug = strtolower((string) preg_replace('/[^a-z0-9_-]/', '', $siteName));
+    $liveRamDir = '/mnt/ramdisk/sites/' . $slug;
+    $existingArchive = SITES_DIR . '/' . $siteName . '.tar.gz';
+    $existingSlugArchive = SITES_DIR . '/' . $slug . '.tar.gz';
+    $archivePath = is_file($existingArchive) ? $existingArchive : (is_file($existingSlugArchive) ? $existingSlugArchive : null);
+
+    if (!is_dir($liveRamDir) && $archivePath === null) {
+        return false;
+    }
+
+    if (is_dir($stageDir)) {
+        exec('/bin/rm -rf ' . escapeshellarg($stageDir));
+    }
+    @mkdir($stageDir, 0775, true);
+
+    if (is_dir($liveRamDir)) {
+        exec('/bin/cp -a ' . escapeshellarg($liveRamDir) . '/. ' . escapeshellarg($stageDir) . '/');
+        return true;
+    }
+
+    if ($archivePath !== null) {
+        safe_php_extract($archivePath, $stageDir, basename($archivePath));
+        return true;
+    }
+
+    return false;
+}
+
+/**
  * Protect and preserve existing working site configurations (.env, database credentials,
  * SQLite databases, database backups, media uploads, and user-specified protected patterns)
  * so that re-uploading an archive or dropping project files does not overwrite them.
  */
-function apply_site_protection(string $siteName, string $stageDir, array $userPatterns = [], string $envContent = ''): array
+function apply_site_protection(string $siteName, string $stageDir, array $userPatterns = [], string $envContent = '', bool $overlayOnly = false): array
 {
     $slug = strtolower((string) preg_replace('/[^a-z0-9_-]/', '', $siteName));
     $liveRamDir = '/mnt/ramdisk/sites/' . $slug;
@@ -319,7 +370,7 @@ function apply_site_protection(string $siteName, string $stageDir, array $userPa
 
     if (is_dir($liveRamDir)) {
         $sourceDir = $liveRamDir;
-    } elseif (is_file($existingArchive) || is_file($existingSlugArchive)) {
+    } elseif (!$overlayOnly && (is_file($existingArchive) || is_file($existingSlugArchive))) {
         $archivePath = is_file($existingArchive) ? $existingArchive : $existingSlugArchive;
         $tempInspectDir = STAGE_DIR . '/.inspect-' . $slug . '-' . bin2hex(random_bytes(4));
         try {
@@ -377,12 +428,74 @@ function apply_site_protection(string $siteName, string $stageDir, array $userPa
         }
     }
 
-    // Save .wtc-protected.json into stageDir so bash backend (store_dir_as_site) also adheres to it
+    // Save .wtc-protected.json into stageDir so bash backend also adheres to it
     @file_put_contents($stageDir . '/.wtc-protected.json', json_encode(array_values(array_unique($allPatterns)), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 
     $restoredFiles = [];
 
-    // If there is an existing site to preserve from
+    if ($overlayOnly) {
+        if ($envContent !== '') {
+            file_put_contents($stageDir . '/.env', $envContent);
+        } elseif ($sourceDir && is_dir($sourceDir)) {
+            $liveEnvPath = $sourceDir . '/.env';
+            if (is_file($liveEnvPath)) {
+                if (!is_file($stageDir . '/.env')) {
+                    $restoredFiles[] = '.env (Preserved in RAM)';
+                } else {
+                    $liveEnv = (string) file_get_contents($liveEnvPath);
+                    $stagedEnv = (string) file_get_contents($stageDir . '/.env');
+                    $merged = $liveEnv;
+                    $newKeysAppended = 0;
+                    foreach (explode("\n", $stagedEnv) as $sLine) {
+                        $trimmed = trim($sLine);
+                        if ($trimmed === '' || str_starts_with($trimmed, '#') || !str_contains($trimmed, '='))
+                            continue;
+                        $k = trim(explode('=', $trimmed, 2)[0]);
+                        if (!preg_match('/^[A-Za-z0-9_]+$/', $k))
+                            continue;
+                        if (!preg_match('/^' . preg_quote($k, '/') . '=/m', $liveEnv)) {
+                            $merged .= "\n" . $trimmed;
+                            $newKeysAppended++;
+                        }
+                    }
+                    file_put_contents($stageDir . '/.env', $merged);
+                    $restoredFiles[] = '.env (Server credentials protected' . ($newKeysAppended > 0 ? ", +$newKeysAppended new keys appended" : '') . ')';
+                }
+            }
+
+            // Remove any protected files from stageDir that already exist in live RAM so they are never overwritten
+            try {
+                $iter = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($stageDir, FilesystemIterator::SKIP_DOTS | FilesystemIterator::CURRENT_AS_FILEINFO),
+                    RecursiveIteratorIterator::LEAVES_ONLY
+                );
+                foreach ($iter as $item) {
+                    if ($item->isFile()) {
+                        $rel = ltrim(str_replace('\\', '/', substr($item->getPathname(), strlen($stageDir))), '/');
+                        if ($rel === '.env' || $rel === '.wtc-protected.json')
+                            continue;
+                        if (matches_protect_pattern($rel, $allPatterns)) {
+                            $liveMatch = $sourceDir . '/' . $rel;
+                            if (is_file($liveMatch) && filesize($liveMatch) > 0) {
+                                @unlink($item->getPathname());
+                                if (!in_array($rel, $restoredFiles, true)) {
+                                    $restoredFiles[] = $rel . ' (Preserved in RAM)';
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                // directory iterator safety
+            }
+        }
+        return [
+            'patterns' => $allPatterns,
+            'restored' => $restoredFiles,
+        ];
+    }
+
+    // Full staging mode (non-overlay): copy protected files into stageDir
     if ($sourceDir && is_dir($sourceDir)) {
         // 1. Preserve & Merge .env
         $liveEnvPath = $sourceDir . '/.env';
@@ -498,6 +611,12 @@ function apply_site_protection(string $siteName, string $stageDir, array $userPa
 /* ------------------------------------------------------------ actions (POST) */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!hash_equals(csrf(), (string) ($_POST['csrf'] ?? ''))) {
+        if (!empty($_POST['is_ajax']) || (!empty($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest')) {
+            header('Content-Type: application/json');
+            http_response_code(400);
+            echo json_encode(['ok' => false, 'error' => 'Bad CSRF token']);
+            exit;
+        }
         http_response_code(400);
         exit('Bad CSRF token');
     }
@@ -522,10 +641,97 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             valid_site($site) ? backend_msg(wtc(['--set', $site]), "Primary active site set to '$site'") : flash('err', 'Bad site name');
             go($back);
         case 'build':
-            valid_site($site) ? backend_msg(wtc(['--build', $site]), "Background build job started for '$site' (npm run build)") : flash('err', 'Bad site name');
+            $cmd = trim((string) ($_POST['cmd'] ?? ''));
+            if ($cmd !== '') {
+                valid_site($site) ? backend_msg(wtc(['--build', $site, $cmd]), "Build job started: $cmd") : flash('err', 'Bad site name');
+            } else {
+                valid_site($site) ? backend_msg(wtc(['--build', $site]), "Background build job started for '$site'") : flash('err', 'Bad site name');
+            }
+            go($back);
+        case 'site_rename':
+            $newSite = strtolower(trim((string) ($_POST['new_name'] ?? '')));
+            if (!valid_site($site)) {
+                flash('err', 'Invalid existing site name');
+            } elseif (!valid_site($newSite)) {
+                flash('err', 'New site name must contain only lowercase letters, numbers, dash and underscore');
+            } else {
+                backend_msg(wtc(['--site-rename', $site, $newSite]), "Renamed site '$site' to '$newSite'");
+            }
+            go($back);
+        case 'site_clone':
+        case 'site_duplicate':
+            $newSite = strtolower(trim((string) ($_POST['new_name'] ?? '')));
+            $port = trim((string) ($_POST['port'] ?? ''));
+            $dbMode = trim((string) ($_POST['db_mode'] ?? 'clone'));
+            $activate = !empty($_POST['activate']) ? '1' : '0';
+
+            if (!valid_site($site)) {
+                flash('err', 'Invalid source site name');
+            } elseif (!valid_site($newSite)) {
+                flash('err', 'Instance name must contain only lowercase letters, numbers, dash and underscore');
+            } elseif ($site === $newSite) {
+                flash('err', 'Target instance name must be different from source system');
+            } else {
+                backend_msg(wtc(['--site-clone', $site, $newSite, $port, $dbMode, $activate]), "Duplicated '$site' into new instance '$newSite'" . ($port !== '' ? " on dedicated port $port" : ""));
+            }
+            go($back);
+        case 'site_stack':
+            $stack = strtolower(trim((string) ($_POST['stack'] ?? '')));
+            if (!valid_site($site)) {
+                flash('err', 'Invalid site name');
+            } elseif ($stack === '') {
+                flash('err', 'Please select a valid stack');
+            } else {
+                backend_msg(wtc(['--site-stack', $site, $stack]), "Assigned stack '$stack' to '$site'");
+            }
+            go($back);
+        case 'site_port':
+            $port = trim((string) ($_POST['port'] ?? ''));
+            if (!valid_site($site)) {
+                flash('err', 'Invalid site name');
+            } else {
+                backend_msg(wtc(['--site-port', $site, $port]), $port !== '' ? "Dedicated port $port configured for '$site'" : "Dedicated port removed for '$site'");
+            }
+            go($back);
+        case 'storage_link':
+            $targetSite = trim((string) ($_POST['site'] ?? ''));
+            if ($targetSite === '') {
+                $statusData = wj('status');
+                $targetSite = (string) ($statusData['active'] ?? '');
+            }
+            if (!valid_site($targetSite)) {
+                flash('err', 'Invalid site name');
+            } else {
+                backend_msg(wtc(['--storage-link', $targetSite]), "Storage link verified and ensured for '$targetSite'");
+            }
             go($back);
         case 'rollback':
-            valid_site($site) ? backend_msg(wtc(['--rollback', $site]), "Rolled back '$site'") : flash('err', 'Bad site name');
+            $ver = trim((string) ($_POST['version'] ?? ''));
+            if (!valid_site($site)) {
+                flash('err', 'Bad site name');
+            } elseif ($ver !== '' && $ver !== 'legacy' && !preg_match('/^[a-zA-Z0-9._-]+\.tar\.gz$/', $ver)) {
+                flash('err', 'Invalid rollback version');
+            } else {
+                $args = $ver !== '' ? ['--rollback', $site, $ver] : ['--rollback', $site];
+                backend_msg(wtc($args), "Rolled back '$site'" . ($ver !== '' ? " to $ver" : ''));
+            }
+            go($back);
+        case 'rollback_delete':
+            $ver = trim((string) ($_POST['version'] ?? ''));
+            if (!valid_site($site) || ($ver !== 'legacy' && !preg_match('/^[a-zA-Z0-9._-]+\.tar\.gz$/', $ver))) {
+                flash('err', 'Invalid site or rollback version');
+            } else {
+                backend_msg(wtc(['--rollback-delete', $site, $ver]), "Deleted rollback '$ver' for '$site'");
+            }
+            go($back);
+        case 'rollback_clear':
+            if ($site === '__ALL__') {
+                backend_msg(wtc(['--rollback-clear', '--all']), 'Cleared all rollback snapshots');
+            } elseif (valid_site($site)) {
+                backend_msg(wtc(['--rollback-clear', $site]), "Cleared rollback snapshots for '$site'");
+            } else {
+                flash('err', 'Bad site name');
+            }
             go($back);
         case 'delete':
             valid_site($site) ? backend_msg(wtc(['--delete', $site]), "Deleted '$site'") : flash('err', 'Bad site name');
@@ -568,7 +774,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             $name = basename((string) $f['name']);
             if (!preg_match('/^[A-Za-z0-9._-]+\.(tar\.gz|tgz|tar|zip)$/', $name) || $f['size'] > MAX_UPLOAD) {
-                flash('err', 'Use a .tar.gz / .tgz / .tar / .zip archive under 1GB');
+                flash('err', 'Use a .tar.gz / .tgz / .tar / .zip archive under 10GB');
                 go($back);
             }
             $siteName = preg_replace('/(\.tar\.gz|\.tgz|\.tar|\.zip)$/i', '', $name);
@@ -580,7 +786,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 @mkdir(STAGE_DIR, 0775, true);
             $dest = STAGE_DIR . '/' . $name;
             if (!move_uploaded_file($f['tmp_name'], $dest)) {
-                flash('err', 'Could not save archive into RAM tmpfs');
+                flash('err', 'Could not save archive into staging area');
                 go($back);
             }
             if (!empty($_POST['protected_patterns'])) {
@@ -621,6 +827,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         case 'drop_upload':
             $isAjax = !empty($_POST['is_ajax']);
             $spinUp = !empty($_POST['spin_up']);
+            $isIncremental = !empty($_POST['incremental_upload']);
+            $recentMinutes = max(0, (int) ($_POST['recent_minutes'] ?? 0));
+            $uploadedFileCount = max(0, (int) ($_POST['uploaded_file_count'] ?? 0));
             $siteCustom = trim((string) ($_POST['site'] ?? ''));
             $detectedStack = (string) ($_POST['detected_stack'] ?? '');
             $envContent = (string) ($_POST['env_content'] ?? '');
@@ -635,71 +844,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
 
+            $stageDir = '';
+            $destArchive = '';
             try {
                 $f = $_FILES['archive'] ?? null;
                 $files = $_FILES['files'] ?? null;
                 $paths = $_POST['paths'] ?? [];
 
                 $siteName = '';
-                $stageDir = '';
                 $hasIndex = false;
+                $uploadType = '';
+                $rawName = '';
+                $detectedPrefix = null;
+                $uploadBytes = 0;
 
                 if ($f && !empty($f['name']) && $f['error'] === UPLOAD_ERR_OK) {
+                    $uploadType = 'archive';
                     $rawName = basename((string) $f['name']);
                     if (!preg_match('/^[A-Za-z0-9._-]+\.(tar\.gz|tgz|tar|zip)$/i', $rawName) || $f['size'] > MAX_UPLOAD) {
-                        throw new RuntimeException('Archive must be .tar.gz, .tgz, .tar, or .zip under 1GB');
+                        throw new RuntimeException('Archive must be .tar.gz, .tgz, .tar, or .zip under 10GB');
                     }
-
+                    $uploadBytes = (int) ($f['size'] ?? 0);
                     $siteName = $siteCustom !== '' ? $siteCustom : preg_replace('/(\.tar\.gz|\.tgz|\.tar|\.zip)$/i', '', $rawName);
-                    $siteName = strtolower((string) preg_replace('/[^a-z0-9_-]/', '-', $siteName));
-                    $siteName = trim($siteName, '-');
-                    if (!valid_site($siteName))
-                        $siteName = 'site-' . date('Ymd-His');
-
-                    $stageDir = STAGE_DIR . '/' . $siteName;
-                    if (!is_dir($stageDir))
-                        @mkdir($stageDir, 0775, true);
-
-                    // Unpack directly in RAM tmpfs
-                    $destArchive = STAGE_DIR . '/.' . $siteName . '-' . time() . '-' . $rawName;
-                    if (!move_uploaded_file($f['tmp_name'], $destArchive)) {
-                        throw new RuntimeException('Could not save uploaded archive into RAM staging');
-                    }
-
-                    // Unpack safely with ZipSlip & symlink defense
-                    safe_php_extract($destArchive, $stageDir, $rawName);
-                    @unlink($destArchive);
-
-                    // Unwrap single top-level directory if present (e.g. zipped folder containing app/, public/, etc.)
-                    // Filter out metadata and hidden files from the decision
-                    $rawEntries = array_diff(scandir($stageDir) ?: [], ['.', '..']);
-                    $meaningfulEntries = array_filter($rawEntries, fn($e) => !in_array($e, ['__MACOSX', '.DS_Store', 'Thumbs.db', 'desktop.ini']));
-
-                    $hasRootEntry = is_file($stageDir . '/index.php') || is_file($stageDir . '/index.html') || is_file($stageDir . '/index.htm') || is_file($stageDir . '/artisan');
-
-                    if (!$hasRootEntry && count($meaningfulEntries) === 1) {
-                        $singleChild = $stageDir . '/' . reset($meaningfulEntries);
-                        if (is_dir($singleChild)) {
-                            // Move everything from the child directory up to stageDir
-                            foreach (array_diff(scandir($singleChild) ?: [], ['.', '..']) as $item) {
-                                rename($singleChild . '/' . $item, $stageDir . '/' . $item);
-                            }
-                            @rmdir($singleChild);
-                        }
-                    }
-
-                    // Clean up any __MACOSX metadata folder
-                    if (is_dir($stageDir . '/__MACOSX')) {
-                        exec('/bin/rm -rf ' . escapeshellarg($stageDir . '/__MACOSX'));
-                    }
-
-                    $hasIndex = is_file($stageDir . '/index.php') || is_file($stageDir . '/index.html') || is_file($stageDir . '/index.htm');
-
                 } elseif ($files && !empty($files['name']) && is_array($files['name']) && count($files['name']) > 0) {
-                    // Check if all paths share a common top-level prefix
+                    $uploadType = 'files';
                     $firstRel = !empty($paths[0]) ? (string) $paths[0] : '';
                     $firstParts = explode('/', str_replace('\\', '/', $firstRel));
-                    $detectedPrefix = null;
                     if (count($firstParts) > 1) {
                         $candidate = $firstParts[0];
                         $allMatch = true;
@@ -713,17 +883,110 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         if ($allMatch)
                             $detectedPrefix = $candidate;
                     }
-
+                    foreach (($files['size'] ?? []) as $sz) {
+                        $uploadBytes += (int) $sz;
+                    }
                     $siteName = $siteCustom !== '' ? $siteCustom : ($detectedPrefix ?: 'site-' . date('Ymd-His'));
-                    $siteName = strtolower((string) preg_replace('/[^a-z0-9_-]/', '-', $siteName));
-                    $siteName = trim($siteName, '-');
-                    if (!valid_site($siteName))
-                        $siteName = 'site-' . date('Ymd-His');
+                } else {
+                    throw new RuntimeException('No files or folder detected in drop');
+                }
 
-                    $stageDir = STAGE_DIR . '/' . $siteName;
-                    if (!is_dir($stageDir))
-                        @mkdir($stageDir, 0775, true);
+                $siteName = strtolower((string) preg_replace('/[^a-z0-9_-]/', '-', $siteName));
+                $siteName = trim($siteName, '-');
+                if (!valid_site($siteName))
+                    $siteName = 'site-' . date('Ymd-His');
 
+                $siteSlug = strtolower((string) preg_replace('/[^a-z0-9_-]/', '', $siteName));
+                $liveRamDir = '/mnt/ramdisk/sites/' . $siteSlug;
+                $existsInRam = is_dir($liveRamDir);
+                $existsOnSd = is_file(SITES_DIR . '/' . $siteName . '.tar.gz');
+                $isUpdate = $existsOnSd || $existsInRam;
+
+                $statusData = wj('status');
+                $curPrimary = (string) ($statusData['active'] ?? '');
+                $isCurrentlyPrimary = ($curPrimary === $siteName || $curPrimary === '');
+                $isCurrentlyActive = $isCurrentlyPrimary || $existsInRam;
+                if (!$isCurrentlyActive) {
+                    $allSites = wj('sites');
+                    foreach ($allSites as $s) {
+                        if (($s['name'] ?? '') === $siteName && !empty($s['active'])) {
+                            $isCurrentlyActive = true;
+                            break;
+                        }
+                    }
+                }
+                $shouldDeployLive = $spinUp || $isCurrentlyActive;
+                $makePrimary = ($isCurrentlyPrimary || !empty($_POST['primary'])) ? '1' : '0';
+                $directOverlayMode = $shouldDeployLive && ($existsInRam || ($isIncremental && $existsOnSd));
+
+                // Stage directly in RAM tmpfs when free RAM allows so reuploads skip SD staging I/O
+                $ramTmpBase = '/mnt/ramdisk/php-tmp';
+                $ramFree = @disk_free_space('/mnt/ramdisk');
+                $useRamStage = $shouldDeployLive && is_dir($ramTmpBase) && is_writable($ramTmpBase)
+                    && $ramFree !== false && $ramFree > ($uploadBytes * 3 + 64 * 1024 * 1024);
+
+                $stageBase = $useRamStage ? $ramTmpBase : STAGE_DIR;
+                if (!is_dir($stageBase))
+                    @mkdir($stageBase, 0775, true);
+
+                $stageDir = $shouldDeployLive
+                    ? ($stageBase . '/.wtc-up-' . $siteSlug . '-' . bin2hex(random_bytes(4)))
+                    : (STAGE_DIR . '/' . $siteName);
+
+                $seededExisting = (!$shouldDeployLive && $isIncremental) && seed_stage_from_existing($siteName, $stageDir);
+                if (!is_dir($stageDir))
+                    @mkdir($stageDir, 0775, true);
+
+                if ($uploadType === 'archive') {
+                    $destArchive = $stageBase . '/.arc-' . $siteSlug . '-' . bin2hex(random_bytes(4)) . '-' . $rawName;
+                    if (!move_uploaded_file($f['tmp_name'], $destArchive)) {
+                        throw new RuntimeException('Could not save uploaded archive into staging area');
+                    }
+
+                    if ($seededExisting) {
+                        $patchDir = $stageBase . '/.patch-' . $siteName . '-' . bin2hex(random_bytes(4));
+                        @mkdir($patchDir, 0775, true);
+                        safe_php_extract($destArchive, $patchDir, $rawName);
+                        @unlink($destArchive);
+                        if (is_dir($patchDir . '/__MACOSX')) {
+                            exec('/bin/rm -rf ' . escapeshellarg($patchDir . '/__MACOSX'));
+                        }
+                        exec('/bin/cp -a ' . escapeshellarg($patchDir) . '/. ' . escapeshellarg($stageDir) . '/');
+                        exec('/bin/rm -rf ' . escapeshellarg($patchDir));
+                        $hasIndex = is_file($stageDir . '/index.php') || is_file($stageDir . '/index.html') || is_file($stageDir . '/index.htm') || is_file($stageDir . '/public/index.php');
+                    } else {
+                        safe_php_extract($destArchive, $stageDir, $rawName);
+                        @unlink($destArchive);
+
+                        if (is_dir($stageDir . '/__MACOSX')) {
+                            exec('/bin/rm -rf ' . escapeshellarg($stageDir . '/__MACOSX'));
+                        }
+
+                        // Unwrap single project wrapper directory for full archives (never unwrap standard app subdirs or incremental patches)
+                        if (!$isIncremental) {
+                            $rawEntries = array_diff(scandir($stageDir) ?: [], ['.', '..']);
+                            $meaningfulEntries = array_filter($rawEntries, fn($e) => !in_array($e, ['__MACOSX', '.DS_Store', 'Thumbs.db', 'desktop.ini']));
+                            $hasRootEntry = is_file($stageDir . '/index.php') || is_file($stageDir . '/index.html') || is_file($stageDir . '/index.htm') || is_file($stageDir . '/artisan');
+
+                            if (!$hasRootEntry && count($meaningfulEntries) === 1) {
+                                $singleName = (string) reset($meaningfulEntries);
+                                $singleChild = $stageDir . '/' . $singleName;
+                                $appSubdirs = ['app', 'bootstrap', 'config', 'database', 'public', 'resources', 'routes', 'storage', 'tests', 'vendor', 'node_modules', 'src', 'dist', 'build', 'out', 'assets', 'css', 'js', 'views', 'wp-content', 'wp-includes', 'wp-admin'];
+                                $isAppSubdir = in_array(strtolower($singleName), $appSubdirs, true);
+                                $childHasRoot = is_file($singleChild . '/artisan') || is_file($singleChild . '/public/index.php') || is_file($singleChild . '/index.php') || is_file($singleChild . '/index.html') || is_file($singleChild . '/wp-config.php');
+
+                                if (is_dir($singleChild) && (!$isAppSubdir || $childHasRoot)) {
+                                    foreach (array_diff(scandir($singleChild) ?: [], ['.', '..']) as $item) {
+                                        rename($singleChild . '/' . $item, $stageDir . '/' . $item);
+                                    }
+                                    @rmdir($singleChild);
+                                }
+                            }
+                        }
+
+                        $hasIndex = is_file($stageDir . '/index.php') || is_file($stageDir . '/index.html') || is_file($stageDir . '/index.htm') || is_file($stageDir . '/public/index.php');
+                    }
+                } else {
                     $fileCount = count($files['name']);
                     for ($i = 0; $i < $fileCount; $i++) {
                         if (($files['error'][$i] ?? 1) !== UPLOAD_ERR_OK)
@@ -748,53 +1011,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             @mkdir($targetDir, 0775, true);
                         @move_uploaded_file($files['tmp_name'][$i], $targetPath);
                     }
-                } else {
-                    throw new RuntimeException('No files or folder detected in drop');
+                    if ($seededExisting || $directOverlayMode) {
+                        $hasIndex = $hasIndex || is_file($stageDir . '/index.php') || is_file($stageDir . '/index.html') || is_file($stageDir . '/index.htm') || is_file($stageDir . '/public/index.php');
+                    }
                 }
 
                 // Apply comprehensive site protection: preserve .env (authoritative DB creds & APP_KEY),
                 // database seeders/dumps, SQLite DBs, storage/app, and user/gitignore protected patterns
-                $protResult = apply_site_protection($siteName, $stageDir, $userProtectedPatterns, $envContent);
+                $protResult = apply_site_protection($siteName, $stageDir, $userProtectedPatterns, $envContent, $directOverlayMode);
 
-                // If Laravel or public/index.php is detected
-                if ($detectedStack === 'laravel' || is_file($stageDir . '/public/index.php')) {
-                    if (!is_file($stageDir . '/index.php')) {
-                        file_put_contents($stageDir . '/index.php', "<?php\n// Forward to Laravel public/ webroot\nrequire_once __DIR__ . '/public/index.php';\n");
-                        $hasIndex = true;
-                    }
-                    if ($envContent === '' && !is_file($stageDir . '/.env')) {
-                        $ip = explode(' ', wj('status')['ips'] ?? '')[0] ?? '127.0.0.1';
-                        file_put_contents($stageDir . '/.env', generate_laravel_env($siteName, $ip));
-                    }
-                    // Placeholder shim only when the framework (vendor/) is genuinely absent.
-                    // Real bootstrap/app.php is backed up; `artisan` in the UI will composer-install and restore it.
-                    if ($deployMode === 'auto_shim' || !is_file($stageDir . '/vendor/autoload.php')) {
-                        generate_laravel_shim($stageDir, $siteName);
-                    }
+                // Only scaffold brand-new site entrypoints/shims when NOT overlaying onto an existing site
+                if (!$directOverlayMode) {
+                    if ($detectedStack === 'laravel' || is_file($stageDir . '/public/index.php')) {
+                        if (!is_file($stageDir . '/index.php')) {
+                            file_put_contents($stageDir . '/index.php', "<?php\n// Forward to Laravel public/ webroot\nrequire_once __DIR__ . '/public/index.php';\n");
+                            $hasIndex = true;
+                        }
+                        if ($envContent === '' && !is_file($stageDir . '/.env')) {
+                            $ip = explode(' ', $statusData['ips'] ?? '')[0] ?? '127.0.0.1';
+                            file_put_contents($stageDir . '/.env', generate_laravel_env($siteName, $ip));
+                        }
+                        if ($deployMode === 'auto_shim' || !is_file($stageDir . '/vendor/autoload.php')) {
+                            generate_laravel_shim($stageDir, $siteName);
+                        }
 
-                    // If storage was excluded or missing, create standard minimal Laravel storage directory structure
-                    if (!is_dir($stageDir . '/storage')) {
+                        @mkdir($stageDir . '/storage/app/public', 0775, true);
                         @mkdir($stageDir . '/storage/framework/views', 0775, true);
                         @mkdir($stageDir . '/storage/framework/sessions', 0775, true);
-                        @mkdir($stageDir . '/storage/framework/cache', 0775, true);
+                        @mkdir($stageDir . '/storage/framework/cache/data', 0775, true);
                         @mkdir($stageDir . '/storage/logs', 0775, true);
                         @mkdir($stageDir . '/bootstrap/cache', 0775, true);
-                    }
-                }
 
-                // If React / Vite / SPA detected or build/dist/out directory present
-                if (
-                    $detectedStack === 'react' ||
-                    $detectedStack === 'static' ||
-                    is_dir($stageDir . '/dist') ||
-                    is_dir($stageDir . '/build') ||
-                    is_dir($stageDir . '/out') ||
-                    is_file($stageDir . '/vite.config.js') ||
-                    is_file($stageDir . '/vite.config.ts') ||
-                    is_file($stageDir . '/vite.config.mjs')
-                ) {
-                    setup_react_spa($stageDir, $siteName);
-                    $hasIndex = true;
+                        if (is_dir($stageDir . '/public')) {
+                            $pubStorage = $stageDir . '/public/storage';
+                            if (is_link($pubStorage)) {
+                                $target = @readlink($pubStorage);
+                                if (!file_exists($pubStorage) || str_contains((string)$target, '.new.') || str_contains((string)$target, '/tmp/') || str_starts_with((string)$target, '/')) {
+                                    @unlink($pubStorage);
+                                }
+                            } elseif (is_dir($pubStorage)) {
+                                $pubFiles = @scandir($pubStorage) ?: [];
+                                foreach ($pubFiles as $pf) {
+                                    if ($pf === '.' || $pf === '..') continue;
+                                    @rename($pubStorage . '/' . $pf, $stageDir . '/storage/app/public/' . $pf);
+                                }
+                                @rmdir($pubStorage);
+                            }
+                            if (!file_exists($pubStorage) && !is_link($pubStorage)) {
+                                @symlink('../storage/app/public', $pubStorage);
+                            }
+                        }
+                    }
+
+                    if (
+                        $detectedStack === 'react' ||
+                        $detectedStack === 'static' ||
+                        is_dir($stageDir . '/dist') ||
+                        is_dir($stageDir . '/build') ||
+                        is_dir($stageDir . '/out') ||
+                        is_file($stageDir . '/vite.config.js') ||
+                        is_file($stageDir . '/vite.config.ts') ||
+                        is_file($stageDir . '/vite.config.mjs')
+                    ) {
+                        setup_react_spa($stageDir, $siteName);
+                        $hasIndex = true;
+                    }
+
+                    if (!$hasIndex) {
+                        file_put_contents($stageDir . '/index.html', "<!doctype html><html><head><meta charset=\"utf-8\"><title>" . h($siteName) . "</title></head><body><h1>" . h($siteName) . "</h1><p>Site loaded directly in RAM.</p></body></html>");
+                    }
                 }
 
                 // If a database seeder SQL file was uploaded with the drop
@@ -813,33 +1098,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
 
-                if (!$hasIndex) {
-                    file_put_contents($stageDir . '/index.html', "<!doctype html><html><head><meta charset=\"utf-8\"><title>" . h($siteName) . "</title></head><body><h1>" . h($siteName) . "</h1><p>Site loaded directly in RAM.</p></body></html>");
-                }
-
-                $isUpdate = is_file(SITES_DIR . '/' . $siteName . '.tar.gz');
-                $statusData = wj('status');
-                $curPrimary = (string) ($statusData['active'] ?? '');
-                $isCurrentlyPrimary = ($curPrimary === $siteName || $curPrimary === '');
-                $isCurrentlyActive = $isCurrentlyPrimary;
-                if (!$isCurrentlyActive) {
-                    $allSites = wj('sites');
-                    foreach ($allSites as $s) {
-                        if (($s['name'] ?? '') === $siteName && !empty($s['active'])) {
-                            $isCurrentlyActive = true;
-                            break;
-                        }
-                    }
-                }
-                $shouldDeployLive = $spinUp || $isCurrentlyActive;
-                $makePrimary = ($isCurrentlyPrimary || !empty($_POST['primary'])) ? '1' : '0';
-
+                $catalogRebuilding = false;
                 if ($shouldDeployLive) {
-                    [$rc, $out, $err] = wtc(['--direct-deploy', $siteName, $stageDir, $makePrimary]);
+                    // 1. Replace files directly in RAM immediately for quickest site access
+                    [$rc, $out, $err] = wtc(['--direct-deploy', $siteName, $stageDir, $makePrimary, '--no-catalog']);
                     if ($rc !== 0)
                         throw new RuntimeException("Backend deployment failed: " . ($err !== '' ? $err : $out));
 
-                    $siteSlug = strtolower((string) preg_replace('/[^a-z0-9_-]/', '', $siteName));
                     $isArtisanApp = (!empty($_POST['detected_stack']) && $_POST['detected_stack'] === 'laravel') ||
                                     is_file('/mnt/ramdisk/webroot/artisan') ||
                                     is_file('/mnt/ramdisk/sites/' . $siteSlug . '/artisan') ||
@@ -848,11 +1113,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $runRouteClear = isset($_POST['run_route_clear']) ? !empty($_POST['run_route_clear']) : $isArtisanApp;
                     $runOptimizeClear = isset($_POST['run_optimize_clear']) ? !empty($_POST['run_optimize_clear']) : $isArtisanApp;
                     $runStorageLink = isset($_POST['run_storage_link']) ? !empty($_POST['run_storage_link']) : $isArtisanApp;
+                    $runZiggyGenerate = isset($_POST['run_ziggy_generate']) ? !empty($_POST['run_ziggy_generate']) : $isArtisanApp;
                     $runMigrations = !empty($_POST['run_migrations']);
                     $runSeeds = !empty($_POST['run_seeds']);
                     $artisanLog = [];
 
-                    if ($isArtisanApp || $runRouteClear || $runOptimizeClear || $runStorageLink || $runMigrations || $runSeeds) {
+                    $hasZiggy = is_dir('/mnt/ramdisk/sites/' . $siteSlug . '/vendor/tightenco/ziggy') ||
+                                is_dir('/mnt/ramdisk/sites/' . $siteName . '/vendor/tightenco/ziggy') ||
+                                ($makePrimary === '1' && is_dir('/mnt/ramdisk/webroot/../vendor/tightenco/ziggy'));
+
+                    if ($isArtisanApp || $runRouteClear || $runOptimizeClear || $runStorageLink || ($runZiggyGenerate && $hasZiggy) || $runMigrations || $runSeeds) {
                         if ($runStorageLink) {
                             [$stRc, $stOut, $stErr] = wtc(['--artisan', $siteName, 'storage:link --force']);
                             $artisanLog[] = [
@@ -880,6 +1150,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             ];
                         }
 
+                        if ($runZiggyGenerate && $hasZiggy) {
+                            [$zRc, $zOut, $zErr] = wtc(['--ziggy', $siteName]);
+                            $artisanLog[] = [
+                                'command' => 'php artisan ziggy:generate',
+                                'ok' => ($zRc === 0),
+                                'output' => trim($zOut !== '' ? $zOut : $zErr)
+                            ];
+                        }
+
                         if ($runMigrations) {
                             [$mRc, $mOut, $mErr] = wtc(['--artisan', $siteName, 'migrate --force']);
                             $artisanLog[] = [
@@ -899,6 +1178,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
 
+                    // 2. Rebuild the SD card catalog in the background after RAM & Artisan hooks are complete
+                    [$catRc] = wtc(['--rebuild-catalog', $siteName]);
+                    $catalogRebuilding = ($catRc === 0);
+
                 } else {
                     [$rc, $out, $err] = wtc(['--store-site', $siteName, $stageDir]);
                     if ($rc !== 0)
@@ -907,14 +1190,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 if ($isAjax) {
                     $dbInfo = json_decode(wtc(['--db-info', $siteName])[1] ?? '', true) ?: [];
-                    $siteSlug = strtolower((string) preg_replace('/[^a-z0-9_-]/', '', $siteName));
                     $liveUrl = ($makePrimary === '1') ? site_url('/') : site_url('/' . $siteSlug . '/');
                     header('Content-Type: application/json');
                     echo json_encode([
                         'ok' => true,
                         'site' => $siteName,
                         'is_update' => $isUpdate,
+                        'incremental_upload' => $isIncremental,
+                        'recent_minutes' => $recentMinutes,
+                        'uploaded_file_count' => $uploadedFileCount,
                         'spun_up' => $shouldDeployLive,
+                        'catalog_rebuilding' => $catalogRebuilding,
                         'is_primary' => ($makePrimary === '1'),
                         'url' => $liveUrl,
                         'db' => $dbInfo,
@@ -929,10 +1215,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $artisanSummary = ' (' . implode(', ', array_map(fn($a) => $a['command'] . ': ' . ($a['ok'] ? 'OK' : 'Error'), $artisanLog)) . ')';
                 }
                 $actionWord = $isUpdate ? 'updated' : 'uploaded';
-                flash('ok', "Site '$siteName' $actionWord" . ($shouldDeployLive ? " and active in RAM!" : "") . $artisanSummary);
+                flash('ok', "Site '$siteName' $actionWord" . ($shouldDeployLive ? " directly in RAM (rebuilding SD catalog in background)!" : "") . $artisanSummary);
                 go($back);
 
             } catch (\Throwable $e) {
+                if ($destArchive !== '' && is_file($destArchive)) {
+                    @unlink($destArchive);
+                }
+                if ($stageDir !== '' && is_dir($stageDir)) {
+                    exec('/bin/rm -rf ' . escapeshellarg($stageDir));
+                }
                 if ($isAjax) {
                     http_response_code(500);
                     header('Content-Type: application/json');
@@ -958,6 +1250,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $runCacheClear = !empty($_POST['run_cache_clear']);
             $runViewClear = !empty($_POST['run_view_clear']);
             $runStorageLink = !empty($_POST['run_storage_link']);
+            $runZiggyGenerate = !empty($_POST['run_ziggy_generate']);
             $runOptimize = !empty($_POST['run_optimize']);
 
             if (!valid_site($site)) {
@@ -977,6 +1270,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($runCacheClear) $cmds[] = 'cache:clear';
             if ($runViewClear) $cmds[] = 'view:clear';
             if ($runOptimizeClear) $cmds[] = 'optimize:clear';
+            if ($runZiggyGenerate) $cmds[] = 'ziggy:generate';
             if ($runStorageLink) $cmds[] = 'storage:link --force';
 
             if ($runFresh) {
@@ -1304,7 +1598,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             [$rc, $out, $err] = wtc(['--service', 'patch', $svc]);
-            $res = json_decode($out, true);
+            $res = json_decode(trim($out), true);
+            if (!is_array($res) && preg_match('/(\{.*\})/s', $out, $jm)) {
+                $res = json_decode($jm[1], true);
+            }
             if ($rc === 0 && is_array($res) && !empty($res['ok'])) {
                 if ($isAjax) {
                     if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
@@ -1331,7 +1628,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $isAjax = !empty($_POST['is_ajax']);
 
             [$rc, $out, $err] = wtc(['--service', 'patch-all']);
-            $res = json_decode($out, true);
+            $res = json_decode(trim($out), true);
+            if (!is_array($res) && preg_match('/(\{.*\})/s', $out, $jm)) {
+                $res = json_decode($jm[1], true);
+            }
             if ($rc === 0 && is_array($res) && !empty($res['ok'])) {
                 if ($isAjax) {
                     if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
@@ -1405,6 +1705,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header('Content-Type: application/json');
             echo json_encode(['ok' => true, 'unit' => $unit, 'version' => $ver, 'cves' => $cves], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
             exit;
+        case 'stack_logs_clear':
+            $source = trim((string) ($_POST['source'] ?? ''));
+            $isAjax = !empty($_POST['is_ajax']);
+            if (!preg_match('/^[a-zA-Z0-9_.:\/-]{1,220}$/', $source) || str_contains($source, '..')) {
+                if ($isAjax) {
+                    header('Content-Type: application/json');
+                    echo json_encode(['ok' => false, 'error' => 'Invalid log source']);
+                    exit;
+                }
+                flash('err', 'Invalid log source');
+                go($back);
+            }
+            [$rc, $out, $err] = wtc(['--stack-logs', 'clear', $source]);
+            $res = json_decode(trim($out), true);
+            if (($rc !== 0 || !is_array($res)) && str_starts_with($source, 'ram:')) {
+                $rel = ltrim(substr($source, 4), '/');
+                $ramRoot = realpath('/mnt/ramdisk') ?: '/mnt/ramdisk';
+                $target = realpath($ramRoot . '/' . $rel);
+                if ($target && str_starts_with($target, $ramRoot . '/') && is_file($target) && is_writable($target)
+                    && preg_match('/\.(log|error|txt)$/i', $target)) {
+                    @file_put_contents($target, '');
+                    $res = ['ok' => true, 'id' => $source, 'label' => $rel];
+                    $rc = 0;
+                }
+            }
+            if ($isAjax) {
+                header('Content-Type: application/json');
+                echo json_encode(is_array($res) ? $res : ['ok' => ($rc === 0), 'error' => ($err !== '' ? $err : 'Unable to clear log')]);
+                exit;
+            }
+            if ($rc === 0 && !empty($res['ok'])) {
+                flash('ok', 'Cleared log file.');
+            } else {
+                flash('err', 'Failed to clear log.');
+            }
+            go($back);
     }
     go('dashboard');
 }
@@ -1449,6 +1785,32 @@ if (($_GET['download'] ?? '') !== '') {
         flash('err', "Package archive for '$siteToDownload' not found.");
         go('sites');
     }
+}
+
+if (!empty($_GET['download_ui_cert'])) {
+    $certPath = null;
+    foreach (['/etc/wtc-web/wtc-ui.crt', '/etc/ssl/wtc-ui/wtc-ui.crt'] as $candidate) {
+        if (@is_file($candidate) && @is_readable($candidate)) {
+            $certPath = $candidate;
+            break;
+        }
+    }
+    if ($certPath !== null) {
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        header('Content-Description: File Transfer');
+        header('Content-Type: application/x-x509-ca-cert');
+        header('Content-Disposition: attachment; filename="pilabwtc-ui.crt"');
+        header('Content-Length: ' . filesize($certPath));
+        header('X-Content-Type-Options: nosniff');
+        readfile($certPath);
+        exit;
+    }
+    http_response_code(404);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "HTTPS certificate not found on server. Run sudo bash update.sh on the Pi first.";
+    exit;
 }
 
 /* ------------------------------------------------------------ GET ajax utilities */
@@ -1626,6 +1988,222 @@ if (($_GET['action'] ?? '') === 'service_logs') {
     echo json_encode(['ok' => true, 'service' => $svc, 'logs' => $logs]);
     exit;
 }
+if (($_GET['action'] ?? '') === 'stack_logs_list') {
+    header('Content-Type: application/json');
+    $siteHint = trim((string) ($_GET['site'] ?? ''));
+    $pathHint = ltrim(str_replace(['\\', '..'], ['/', ''], (string) ($_GET['path'] ?? '')), '/');
+
+    [$rc, $out] = wtc(['--json', 'stack_logs']);
+    $sources = ($rc === 0) ? json_decode($out, true) : null;
+    if (!is_array($sources)) {
+        $sources = [];
+    }
+
+    // Augment / fallback: scan /mnt/ramdisk directly within open_basedir for .log / .error files
+    $knownIds = [];
+    foreach ($sources as $s) {
+        if (!empty($s['id'])) $knownIds[$s['id']] = true;
+    }
+
+    $ramRoot = realpath('/mnt/ramdisk');
+    if ($ramRoot && is_dir($ramRoot)) {
+        $ramSitesDir = $ramRoot . '/sites';
+        if (is_dir($ramSitesDir)) {
+            $siteDirs = @scandir($ramSitesDir) ?: [];
+            foreach ($siteDirs as $sd) {
+                if ($sd === '.' || $sd === '..' || !is_dir($ramSitesDir . '/' . $sd)) continue;
+                $sPath = $ramSitesDir . '/' . $sd;
+                $candidates = [];
+                foreach (['storage/logs/*.log', 'logs/*.log', 'log/*.log', '*.log'] as $globPat) {
+                    foreach (glob($sPath . '/' . $globPat) ?: [] as $gf) {
+                        if (is_file($gf)) $candidates[] = $gf;
+                    }
+                }
+                foreach (array_unique($candidates) as $lf) {
+                    $rel = ltrim(str_replace('\\', '/', substr($lf, strlen($ramRoot))), '/');
+                    $id = 'ram:' . $rel;
+                    if (isset($knownIds[$id])) continue;
+                    $knownIds[$id] = true;
+                    $fmt = str_contains($rel, 'storage/logs/') ? 'laravel' : 'auto';
+                    $sources[] = [
+                        'id' => $id,
+                        'label' => $sd . ' / ' . basename($lf),
+                        'category' => 'Application Stacks',
+                        'stack' => $fmt === 'laravel' ? 'laravel' : 'app',
+                        'site' => $sd,
+                        'path' => $lf,
+                        'relPath' => $rel,
+                        'format' => $fmt,
+                        'size' => @filesize($lf) ?: 0,
+                        'mtime' => @filemtime($lf) ?: 0,
+                        'exists' => true,
+                        'clearable' => is_writable($lf),
+                        'primary' => false
+                    ];
+                }
+            }
+        }
+        $rejDir = $ramRoot . '/rejected';
+        if (is_dir($rejDir)) {
+            foreach (glob($rejDir . '/*.error') ?: [] as $rf) {
+                if (!is_file($rf)) continue;
+                $rel = ltrim(str_replace('\\', '/', substr($rf, strlen($ramRoot))), '/');
+                $id = 'ram:' . $rel;
+                if (isset($knownIds[$id])) continue;
+                $knownIds[$id] = true;
+                $sources[] = [
+                    'id' => $id,
+                    'label' => 'Rejected: ' . basename($rf),
+                    'category' => 'RAM Drive Errors',
+                    'stack' => 'dropbox',
+                    'site' => '',
+                    'path' => $rf,
+                    'relPath' => $rel,
+                    'format' => 'wtc',
+                    'size' => @filesize($rf) ?: 0,
+                    'mtime' => @filemtime($rf) ?: 0,
+                    'exists' => true,
+                    'clearable' => is_writable($rf),
+                    'primary' => false
+                ];
+            }
+        }
+    }
+
+    // If pathHint points directly to a file or site directory in RAM, pick best matching source
+    $recommended = '';
+    if ($pathHint !== '') {
+        $exactId = 'ram:' . $pathHint;
+        if (isset($knownIds[$exactId])) {
+            $recommended = $exactId;
+        } else {
+            // Check if pathHint is inside sites/<slug>/... or webroot/...
+            if (preg_match('#^sites/([^/]+)#', $pathHint, $pm)) {
+                $siteHint = $siteHint !== '' ? $siteHint : $pm[1];
+            }
+            foreach ($sources as $s) {
+                if (!empty($s['relPath']) && str_starts_with($s['relPath'], rtrim($pathHint, '/') . '/')) {
+                    $recommended = $s['id'];
+                    break;
+                }
+            }
+        }
+    }
+    if ($recommended === '' && $siteHint !== '') {
+        $siteSlugHint = strtolower(preg_replace('/[^a-z0-9_-]/', '', str_replace(' ', '', $siteHint)));
+        foreach ($sources as $s) {
+            $sSite = strtolower((string) ($s['site'] ?? ''));
+            $sRel = strtolower((string) ($s['relPath'] ?? ''));
+            if ($sSite !== '' && ($sSite === strtolower($siteHint) || $sSite === $siteSlugHint || str_starts_with($sRel, 'sites/' . $siteSlugHint . '/'))) {
+                $recommended = $s['id'];
+                break;
+            }
+        }
+        // Fallback for non-Laravel sites (SPA/static/PHP) -> prefer nginx-error or build log if relevant
+        if ($recommended === '') {
+            if (isset($knownIds['nginx-error'])) {
+                $recommended = 'nginx-error';
+            }
+        }
+    }
+    if ($recommended === '') {
+        foreach ($sources as $s) {
+            if (!empty($s['primary']) && !empty($s['exists'])) {
+                $recommended = $s['id'];
+                break;
+            }
+        }
+    }
+    if ($recommended === '') {
+        foreach ($sources as $s) {
+            if (($s['category'] ?? '') === 'Application Stacks' && !empty($s['exists']) && (int) ($s['size'] ?? 0) > 0) {
+                $recommended = $s['id'];
+                break;
+            }
+        }
+    }
+    if ($recommended === '' && isset($knownIds['wtc-manage'])) {
+        $recommended = 'wtc-manage';
+    }
+
+    echo json_encode([
+        'ok' => true,
+        'sources' => $sources,
+        'recommended' => $recommended
+    ], JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+    exit;
+}
+if (($_GET['action'] ?? '') === 'stack_logs_read') {
+    header('Content-Type: application/json');
+    $source = trim((string) ($_GET['source'] ?? 'wtc-manage'));
+    $lines = (int) ($_GET['lines'] ?? 200);
+    if ($lines < 10) $lines = 10;
+    if ($lines > 2000) $lines = 2000;
+
+    if (!preg_match('/^[a-zA-Z0-9_.:\/-]{1,220}$/', $source) || str_contains($source, '..')) {
+        echo json_encode(['ok' => false, 'error' => 'Invalid log source identifier']);
+        exit;
+    }
+
+    [$rc, $out, $err] = wtc(['--stack-logs', 'read', $source, (string) $lines]);
+    $decoded = ($rc === 0) ? json_decode($out, true) : null;
+    if (is_array($decoded) && isset($decoded['ok'])) {
+        echo json_encode($decoded, JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+        exit;
+    }
+
+    // Fallback: direct safe tail read for /mnt/ramdisk/... files
+    if (str_starts_with($source, 'ram:')) {
+        $rel = ltrim(substr($source, 4), '/');
+        $ramRoot = realpath('/mnt/ramdisk');
+        $target = $ramRoot ? realpath($ramRoot . '/' . $rel) : false;
+        if ($ramRoot && $target && str_starts_with($target, $ramRoot . '/') && is_file($target)
+            && preg_match('/\.(log|error|txt)$/i', $target)) {
+            $fp = @fopen($target, 'rb');
+            $content = '';
+            if ($fp) {
+                fseek($fp, 0, SEEK_END);
+                $pos = ftell($fp);
+                $chunkSize = 8192;
+                $lineCount = 0;
+                $buf = '';
+                while ($pos > 0 && $lineCount <= $lines) {
+                    $readLen = min($chunkSize, $pos);
+                    $pos -= $readLen;
+                    fseek($fp, $pos, SEEK_SET);
+                    $chunk = fread($fp, $readLen);
+                    $buf = $chunk . $buf;
+                    $lineCount = substr_count($buf, "\n");
+                }
+                fclose($fp);
+                $allLines = explode("\n", str_replace("\r\n", "\n", $buf));
+                if (count($allLines) > $lines) {
+                    $allLines = array_slice($allLines, -$lines);
+                }
+                $content = implode("\n", $allLines);
+            }
+            echo json_encode([
+                'ok' => true,
+                'id' => $source,
+                'label' => $rel,
+                'path' => $target,
+                'format' => str_contains($rel, 'storage/logs/') ? 'laravel' : 'auto',
+                'exists' => true,
+                'size' => @filesize($target) ?: 0,
+                'mtime' => @filemtime($target) ?: 0,
+                'clearable' => is_writable($target),
+                'content' => $content
+            ], JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+            exit;
+        }
+    }
+
+    echo json_encode([
+        'ok' => false,
+        'error' => $err !== '' ? $err : 'Log source unavailable or backend unreachable.'
+    ]);
+    exit;
+}
 if (($_GET['action'] ?? '') === 'services_json') {
     header('Content-Type: application/json');
     $data = wj('services', true);
@@ -1728,12 +2306,15 @@ $pages = [
     'transfer' => '🔄 File Transfer',
     'firewall' => '🛡️ Firewall & Ports',
     'stack' => '📦 Stack Components',
+    'stack_manager' => '📦 Stack Manager',
     'settings' => '⚙️ Settings',
     'logs' => '📜 Logs'
 ];
+if ($page === 'stack-manager')
+    $page = 'stack_manager';
 if (!isset($pages[$page]))
     $page = 'dashboard';
-$refresh = ($page === 'stack' && !empty(wj('stack')['busy'])) ? 3 : 0;
+$refresh = (($page === 'stack' && !empty(wj('stack')['busy'])) || ($page === 'stack_manager' && !empty(wj('build')['busy']))) ? 3 : 0;
 
 function form(string $action, array $fields, string $btn, string $cls = '', string $confirm = ''): string
 {
@@ -2656,6 +3237,356 @@ tr.site-row.dragover td {
     background: #1f6feb;
     color: #ffffff;
     border-color: #58a6ff;
+}
+
+/* Stack Logs Viewer & Formatter (Zero-Library) */
+.lv-root {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.lv-topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 10px 12px;
+}
+.lv-src-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 240px;
+    flex-wrap: wrap;
+}
+.lv-src-label {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: #f0f6fc;
+    white-space: nowrap;
+}
+.lv-src-select {
+    flex: 1;
+    min-width: 220px;
+    max-width: 480px;
+    background: #050a10;
+    border: 1px solid #388bfd;
+    color: #79c0ff;
+    font-weight: 600;
+    font-size: 0.84rem;
+    padding: 5px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+}
+.lv-ctrl-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.lv-line-select {
+    background: #050a10;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    font-size: 0.8rem;
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+.lv-btn {
+    font-size: 0.78rem;
+    padding: 4px 10px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    text-decoration: none;
+}
+.lv-live-active {
+    background: #12281e !important;
+    border-color: #2ea043 !important;
+    color: #3fb950 !important;
+}
+.lv-infostrip {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 0.78rem;
+    color: #8b949e;
+    padding: 2px 4px;
+}
+.lv-info-left, .lv-info-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.lv-path-code {
+    font-size: 0.76rem;
+    color: #79c0ff;
+    background: #050a10;
+    padding: 2px 6px;
+    border: 1px solid #21262d;
+    border-radius: 4px;
+}
+.lv-fmt-pill {
+    background: #13233a;
+    color: #79c0ff;
+    border-color: #1f6feb;
+    font-size: 0.68rem;
+}
+.lv-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    background: #090d13;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+.lv-filter-pills {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.lv-pill {
+    background: #161b22;
+    color: #8b949e;
+    border: 1px solid #30363d;
+    border-radius: 14px;
+    padding: 3px 10px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: all 0.12s ease;
+}
+.lv-pill:hover {
+    color: #f0f6fc;
+    border-color: #58a6ff;
+}
+.lv-pill.active {
+    background: #1f6feb;
+    color: #ffffff;
+    border-color: #388bfd;
+}
+.lv-pill-error.active { background: #da3633; border-color: #f85149; }
+.lv-pill-warn.active { background: #9e6a03; border-color: #d29922; }
+.lv-pill-info.active { background: #1f6feb; border-color: #58a6ff; }
+.lv-pill-debug.active { background: #6e40c9; border-color: #a371f7; }
+.lv-pill-cnt {
+    background: rgba(0, 0, 0, 0.35);
+    padding: 0 5px;
+    border-radius: 10px;
+    font-size: 0.7rem;
+}
+.lv-search {
+    flex: 1;
+    min-width: 180px;
+    max-width: 340px;
+    background: #050a10;
+    border: 1px solid #30363d;
+    color: #f0f6fc;
+    padding: 5px 10px;
+    border-radius: 5px;
+    font-size: 0.8rem;
+}
+.lv-right-controls {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+.lv-list {
+    background: #050a10;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    max-height: 62vh;
+    overflow-y: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.8rem;
+}
+.lv-raw-pre {
+    background: #050a10;
+    color: #c9d1d9;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    max-height: 62vh;
+    overflow-y: auto;
+    padding: 12px;
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.lv-entry {
+    border-bottom: 1px solid #131922;
+    padding: 6px 10px;
+    border-left: 3px solid transparent;
+    transition: background 0.1s ease;
+}
+.lv-entry:hover {
+    background: #0d1520;
+}
+.lv-entry.lv-lvl-error { border-left-color: #f85149; background: rgba(248, 81, 73, 0.04); }
+.lv-entry.lv-lvl-warn { border-left-color: #d29922; background: rgba(210, 153, 34, 0.04); }
+.lv-entry.lv-lvl-ok { border-left-color: #3fb950; }
+.lv-entry.lv-lvl-info { border-left-color: #388bfd; }
+.lv-entry.lv-lvl-debug { border-left-color: #8957e5; }
+.lv-entry-section {
+    background: #0e1928 !important;
+    border-left-color: #58a6ff !important;
+}
+.lv-entry-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    line-height: 1.45;
+}
+.lv-lnum {
+    color: #484f58;
+    font-size: 0.72rem;
+    min-width: 28px;
+    text-align: right;
+    user-select: none;
+}
+.lv-ts {
+    color: #8b949e;
+    font-size: 0.75rem;
+    white-space: nowrap;
+}
+.lv-badge {
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    white-space: nowrap;
+    letter-spacing: 0.02em;
+}
+.lv-badge-error { background: #3c1618; color: #ff7b72; border: 1px solid #da363366; }
+.lv-badge-warn { background: #33240a; color: #e3b341; border: 1px solid #d2992266; }
+.lv-badge-ok { background: #12281e; color: #56d364; border: 1px solid #23863666; }
+.lv-badge-info { background: #13233a; color: #79c0ff; border: 1px solid #1f6feb66; }
+.lv-badge-debug { background: #26193d; color: #d2a8ff; border: 1px solid #8957e566; }
+.lv-method-get { background: #12281e; color: #56d364; border: 1px solid #23863666; }
+.lv-method-post { background: #13233a; color: #79c0ff; border: 1px solid #1f6feb66; }
+.lv-method-put, .lv-method-patch { background: #33240a; color: #e3b341; border: 1px solid #d2992266; }
+.lv-method-delete { background: #3c1618; color: #ff7b72; border: 1px solid #da363366; }
+.lv-tag {
+    color: #a5d6ff;
+    background: #111923;
+    border: 1px solid #21262d;
+    padding: 0 5px;
+    border-radius: 3px;
+    font-size: 0.73rem;
+    white-space: nowrap;
+}
+.lv-msg {
+    color: #e6edf3;
+    word-break: break-word;
+    flex: 1;
+    min-width: 180px;
+}
+.lv-entry-toggles {
+    margin-left: auto;
+}
+.lv-toggle-btn {
+    background: #161b22;
+    color: #79c0ff;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 1px 7px;
+    font-size: 0.72rem;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.lv-toggle-btn:hover {
+    background: #1f2937;
+    border-color: #58a6ff;
+}
+.lv-entry-details {
+    margin-top: 6px;
+    margin-left: 36px;
+    padding: 8px 10px;
+    background: #0a1018;
+    border: 1px solid #1f2937;
+    border-radius: 5px;
+}
+.lv-meta-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.lv-meta-chip {
+    background: #111720;
+    border: 1px solid #21262d;
+    border-radius: 4px;
+    padding: 2px 7px;
+    font-size: 0.74rem;
+    display: inline-flex;
+    gap: 4px;
+}
+.lv-meta-k { color: #8b949e; }
+.lv-meta-v { color: #a5d6ff; word-break: break-all; }
+.lv-json-block {
+    background: #060a0f;
+    color: #7ee787;
+    border: 1px solid #1c2128;
+    border-radius: 4px;
+    padding: 8px;
+    margin: 6px 0 0 0;
+    font-size: 0.75rem;
+    max-height: 240px;
+    overflow: auto;
+    white-space: pre-wrap;
+}
+.lv-trace-block {
+    margin-top: 6px;
+    max-height: 260px;
+    overflow-y: auto;
+    font-size: 0.74rem;
+    line-height: 1.45;
+}
+.lv-trace-line {
+    padding: 1px 4px;
+    border-radius: 2px;
+    word-break: break-all;
+}
+.lv-trace-line:hover { background: #121b26; }
+.lv-trace-idx { color: #79c0ff; font-weight: 600; }
+.lv-trace-file { color: #e3b341; }
+.lv-trace-call { color: #c9d1d9; }
+.lv-loading, .lv-empty, .lv-error {
+    padding: 24px 16px;
+    text-align: center;
+    color: #8b949e;
+    font-size: 0.85rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+.lv-error {
+    color: #ff7b72;
+    background: rgba(248, 81, 73, 0.08);
+}
+.lv-modal-dialog {
+    max-width: 1080px;
+    width: 96vw;
+}
+.lv-modal-head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.lv-modal-body {
+    padding: 14px 16px;
 }
 
 footer { text-align: center; color: #484f58; font-size: 0.78rem; padding: 16px 20px; border-top: 1px solid #21262d; margin-top: auto; }

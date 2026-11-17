@@ -11,6 +11,7 @@ declare(strict_types=1);
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="wtc-csrf" content="<?= h(csrf()) ?>">
     <?php if ($refresh): ?>
         <meta http-equiv="refresh" content="<?= (int) $refresh ?>">
     <?php endif; ?>
@@ -19,6 +20,7 @@ declare(strict_types=1);
         <?= css() ?>
     </style>
     <script src="/js/dash-live.js?v=<?= file_exists(__DIR__ . '/../js/dash-live.js') ? filemtime(__DIR__ . '/../js/dash-live.js') : time() ?>"></script>
+    <script src="/js/log-viewer.js?v=<?= file_exists(__DIR__ . '/../js/log-viewer.js') ? filemtime(__DIR__ . '/../js/log-viewer.js') : time() ?>"></script>
     <script defer src="/js/spa.js?v=<?= filemtime(__DIR__ . '/../js/spa.js') ?>"></script>
 </head>
 
@@ -42,6 +44,7 @@ declare(strict_types=1);
         </nav>
         <span class="sp"></span>
         <div class="header-actions">
+            <button type="button" class="btn-live" onclick="openHttpsCertModal()" title="Download self-signed HTTPS certificate and view browser install instructions">🔐 HTTPS Cert</button>
             <form method="post" style="display:inline"
                 onsubmit="return confirm('Reload Management UI from SD card into RAM drive? This will update the running UI without rebooting.')">
                 <?= csrf_field() ?>

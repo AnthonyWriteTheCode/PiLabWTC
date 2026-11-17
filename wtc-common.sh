@@ -20,6 +20,8 @@ WTC_CONF="${WTC_CONF:-/etc/wtc-web/wtc.conf}"
 : "${FAN_ON_WIFI_DISCONNECT:=no}"
 : "${FAN_WIFI_MODE:=pulse}"
 : "${FAN_GPIO:=14}"
+: "${FORCE_HTTPS:=no}"
+: "${ROLLBACK_KEEP:=5}"
 
 # ---- paths ----
 : "${SITES_DIR:=/opt/wtc-web/sites}"
@@ -33,7 +35,7 @@ WTC_CONF="${WTC_CONF:-/etc/wtc-web/wtc.conf}"
 : "${REJECT_DIR:=$RAM_MOUNT/rejected}"
 : "${PROCESSED_DIR:=$RAM_MOUNT/processed}"
 : "${PHP_TMP:=$RAM_MOUNT/php-tmp}"
-: "${STAGE_DIR:=$PHP_TMP/staging}"
+: "${STAGE_DIR:=/var/tmp/wtc-staging}"
 : "${DROP_GROUP:=wtc-drop}"
 : "${SAMBA_USER:=wtcdrop}" 
 : "${STATE_FILE:=/etc/wtc-web/active_site.conf}"
@@ -66,7 +68,7 @@ need_root() {
 
 # Safely extract .tar.gz, .tgz, .tar, or .zip archive into destDir with ZipSlip & symlink defenses
 safe_extract_archive() {
-  local archive="$1" destDir="$2" listing=""
+  local archive="$1" destDir="$2"
   [ -f "$archive" ] || die "Archive not found: $archive"
   mkdir -p "$destDir"
 
@@ -75,26 +77,28 @@ safe_extract_archive() {
     tar_cmd=(tar --use-compress-program=pigz)
   fi
 
+  # 1. Pre-check: Reject path traversal (ZipSlip / TarSlip) via streaming pipeline (avoids buffering 400k lines in memory)
   case "$archive" in
     *.tar.gz|*.tgz)
-      listing="$("${tar_cmd[@]}" -tf "$archive" 2>/dev/null)" || die "Invalid or corrupted tar archive"
+      if "${tar_cmd[@]}" -tf "$archive" 2>/dev/null | grep -Eq '(^|/)\.\.(/|$)|^/'; then
+        die "Archive rejected: contains absolute or parent directory ('..') path traversal"
+      fi
       ;;
     *.tar)
-      listing="$(tar -tf "$archive" 2>/dev/null)" || die "Invalid or corrupted tar archive"
+      if tar -tf "$archive" 2>/dev/null | grep -Eq '(^|/)\.\.(/|$)|^/'; then
+        die "Archive rejected: contains absolute or parent directory ('..') path traversal"
+      fi
       ;;
     *.zip)
       command -v unzip >/dev/null 2>&1 || die "unzip utility not installed"
-      listing="$(unzip -Z1 "$archive" 2>/dev/null)" || die "Invalid or corrupted zip archive"
+      if unzip -Z1 "$archive" 2>/dev/null | grep -Eq '(^|/)\.\.(/|$)|^/'; then
+        die "Archive rejected: contains absolute or parent directory ('..') path traversal"
+      fi
       ;;
     *)
       die "Unsupported archive format: $archive"
       ;;
   esac
-
-  # 1. Pre-check: Reject path traversal (ZipSlip / TarSlip)
-  if echo "$listing" | grep -Eq '(^|/)\.\.(/|$)|^/'; then
-    die "Archive rejected: contains absolute or parent directory ('..') path traversal"
-  fi
 
   # 2. Extract
   case "$archive" in
@@ -129,14 +133,26 @@ safe_extract_archive() {
 valid_name() { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; }
 
 list_sites() {
-  local f cur
+  local f cur s seen=""
   cur="$(active_site)"
   for f in "$SITES_DIR"/*.tar.gz; do
     [ -e "$f" ] || continue
-    basename "$f" .tar.gz
+    s="$(basename "$f" .tar.gz)"
+    echo "$s"
+    seen="$seen|$s|"
   done
-  if [ -n "$cur" ] && [ ! -f "$SITES_DIR/$cur.tar.gz" ]; then
-    echo "$cur"
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    case "$seen" in
+      *"|$s|"*) ;;
+      *) echo "$s"; seen="$seen|$s|" ;;
+    esac
+  done < <(list_active_sites)
+  if [ -n "$cur" ]; then
+    case "$seen" in
+      *"|$cur|"*) ;;
+      *) echo "$cur" ;;
+    esac
   fi
 }
 
@@ -191,14 +207,14 @@ ensure_ramdisk() {
     mount -t tmpfs -o "size=$RAM_SIZE,mode=0755,nosuid,nodev" tmpfs "$RAM_MOUNT"
     log "Mounted tmpfs ($RAM_SIZE) on $RAM_MOUNT"
   fi
-  mkdir -p "$RELEASES_DIR" "$RAM_SITES_DIR" "$RAM_NGINX_SITES" "$DROP_DIR" "$REJECT_DIR" "$PHP_TMP" "$PHP_TMP/nginx-body" "$STAGE_DIR"
+  mkdir -p "$RELEASES_DIR" "$RAM_SITES_DIR" "$RAM_NGINX_SITES" "$DROP_DIR" "$REJECT_DIR" "$PHP_TMP" "$PHP_TMP/nginx-body" "$STAGE_DIR" "/var/tmp/nginx-body" "/var/tmp/wtc-staging"
   if getent group "$DROP_GROUP" >/dev/null; then
     chgrp "$DROP_GROUP" "$DROP_DIR" "$REJECT_DIR"
   fi
   chmod 2775 "$DROP_DIR" "$REJECT_DIR"
-  chmod 1777 "$PHP_TMP" "$STAGE_DIR"
-  chown -R www-data:www-data "$PHP_TMP/nginx-body" 2>/dev/null || true
-  chmod 0700 "$PHP_TMP/nginx-body" 2>/dev/null || true
+  chmod 1777 "$PHP_TMP" "$STAGE_DIR" "/var/tmp/wtc-staging"
+  chown -R www-data:www-data "$PHP_TMP/nginx-body" "/var/tmp/nginx-body" "$STAGE_DIR" 2>/dev/null || true
+  chmod 0700 "$PHP_TMP/nginx-body" "/var/tmp/nginx-body" 2>/dev/null || true
   mkdir -p "$SITES_DIR" "$PREV_DIR" "$(dirname "$STATE_FILE")"
   if [ ! -f "$RAM_NGINX_CONF" ]; then
     cat > "$RAM_NGINX_CONF" <<'EOF'
@@ -374,33 +390,413 @@ preserve_existing_site_configs() {
   [ -n "$ext_tmp" ] && [ -d "$ext_tmp" ] && rm -rf "$ext_tmp" || true
 }
 
-# Pack <dir> into SITES_DIR/<name>.tar.gz atomically, keeping one previous copy.
+# Protect existing live files in RAM ($live_dir) before overlaying uploaded files from $upload_dir.
+# Merges .env (keeping live server credentials authoritative) and removes protected files from
+# $upload_dir that already exist in $live_dir so cp -a never overwrites live configs/data.
+protect_ram_overlay() {
+  local site="$1" upload_dir="$2" live_dir="$3"
+  [ -n "$site" ] && [ -d "$upload_dir" ] && [ -d "$live_dir" ] || return 0
+
+  local patterns=('.env' '.env.*' '.wtc-database.sql' '.wtc-db.sql' '.wtc-db.php' 'nginx.conf' 'wtc.json' 'wp-config.php' 'database/*.sqlite' '*.sqlite' '*.db')
+
+  local pjson
+  for pjson in "$upload_dir/.wtc-protected.json" "$live_dir/.wtc-protected.json"; do
+    if [ -f "$pjson" ] && command -v jq >/dev/null 2>&1; then
+      while IFS= read -r p; do
+        [ -n "$p" ] && patterns+=("$p")
+      done < <(jq -r '.[]? // empty' "$pjson" 2>/dev/null || true)
+    fi
+  done
+
+  local gi line
+  for gi in "$upload_dir/.gitignore" "$live_dir/.gitignore" "$upload_dir/.wtcignore" "$live_dir/.wtcignore"; do
+    if [ -f "$gi" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        line="$(echo "$line" | sed -e 's/[[:space:]]*#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -n "$line" ] || continue
+        line="${line#/}"
+        if [[ "$line" =~ (\.env|\.sql|\.sqlite|\.db|storage|config|secret|key|upload) ]]; then
+          patterns+=("$line")
+        fi
+      done < "$gi"
+    fi
+  done
+
+  # 1. Merge .env safely into live RAM .env, then remove from upload_dir so cp doesn't clobber it
+  if [ -f "$live_dir/.env" ] && [ -f "$upload_dir/.env" ]; then
+    local merged_tmp; merged_tmp="$(mktemp "${STAGE_DIR:-/tmp}/.env_merged.XXXXXX" 2>/dev/null || mktemp "/tmp/.env_merged.XXXXXX")"
+    cp -p "$live_dir/.env" "$merged_tmp"
+    while IFS= read -r line || [ -n "$line" ]; do
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+      local k="${line%%=*}"
+      k="$(echo "$k" | tr -d '[:space:]')"
+      [ -n "$k" ] || continue
+      if ! grep -qE "^[[:space:]]*${k}=" "$live_dir/.env" 2>/dev/null; then
+        echo "$line" >> "$merged_tmp"
+      fi
+    done < "$upload_dir/.env"
+    chown "${WEB_USER:-www-data}:${WEB_USER:-www-data}" "$merged_tmp" 2>/dev/null || true
+    chmod 0644 "$merged_tmp" 2>/dev/null || true
+    mv -f "$merged_tmp" "$live_dir/.env"
+    rm -f "$upload_dir/.env"
+  fi
+
+  # 2. Never overwrite existing storage/app files in RAM
+  if [ -d "$live_dir/storage/app" ] && [ -d "$upload_dir/storage/app" ]; then
+    local uf rel_f
+    while IFS= read -r uf; do
+      [ -f "$uf" ] || continue
+      rel_f="${uf#$upload_dir/}"
+      if [ -f "$live_dir/$rel_f" ] && [ -s "$live_dir/$rel_f" ]; then
+        rm -f "$uf"
+      fi
+    done < <(find "$upload_dir/storage/app" -type f 2>/dev/null || true)
+  fi
+
+  # 3. Never overwrite protected files that already exist in RAM
+  local pat match_f rel_f clean_pat
+  for pat in "${patterns[@]}"; do
+    [ -n "$pat" ] || continue
+    clean_pat="${pat#/}"
+    clean_pat="${clean_pat%/**}"
+    clean_pat="${clean_pat%/}"
+    if [[ "$pat" == *"*"* ]] || [ -d "$upload_dir/$clean_pat" ]; then
+      while IFS= read -r match_f; do
+        [ -f "$match_f" ] || continue
+        rel_f="${match_f#$upload_dir/}"
+        if [ -f "$live_dir/$rel_f" ] && [ -s "$live_dir/$rel_f" ]; then
+          rm -f "$match_f"
+        fi
+      done < <(find "$upload_dir" -type f \( -path "$upload_dir/$pat" -o -path "$upload_dir/$clean_pat/*" \) 2>/dev/null || true)
+    else
+      if [ -f "$upload_dir/$clean_pat" ] && [ -f "$live_dir/$clean_pat" ] && [ -s "$live_dir/$clean_pat" ]; then
+        rm -f "$upload_dir/$clean_pat"
+      fi
+    fi
+  done
+}
+
+# Ensure Laravel sites have a complete storage hierarchy and public/storage properly linked to storage/app/public.
+# Enforces relative symlink (../storage/app/public) so that directory swaps, tar archives, and cloning never break.
+ensure_laravel_storage_link() {
+  local dir="${1:-}"
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+
+  # Check if directory is a Laravel application
+  local is_laravel=0
+  if [ -f "$dir/artisan" ] || [ -f "$dir/public/index.php" ]; then
+    is_laravel=1
+  elif [ -d "$dir/public" ] && [ -d "$dir/storage" ]; then
+    is_laravel=1
+  elif [ -f "$dir/composer.json" ] && grep -qiE '"laravel/framework"' "$dir/composer.json" 2>/dev/null; then
+    is_laravel=1
+  fi
+
+  [ "$is_laravel" -eq 1 ] || return 0
+
+  local pub_dir="$dir/public"
+  local storage_pub="$dir/storage/app/public"
+  local pub_storage="$pub_dir/storage"
+
+  # 1. Guarantee complete Laravel storage directory structure
+  mkdir -p "$storage_pub" \
+           "$dir/storage/framework/cache/data" \
+           "$dir/storage/framework/sessions" \
+           "$dir/storage/framework/views" \
+           "$dir/storage/logs" \
+           "$dir/bootstrap/cache" 2>/dev/null || true
+
+  [ -d "$pub_dir" ] || return 0
+
+  # 2. If public/storage is a physical directory (not a symlink), preserve files by moving into storage/app/public
+  if [ -d "$pub_storage" ] && [ ! -L "$pub_storage" ]; then
+    log "Notice: Migrating existing files from public/storage directory to storage/app/public in '$dir'..."
+    cp -rn "$pub_storage"/* "$storage_pub"/ 2>/dev/null || true
+    rm -rf "$pub_storage" 2>/dev/null || true
+  fi
+
+  # 3. If public/storage is a symlink, check if broken, obsolete, or pointing to a temporary staging path
+  if [ -L "$pub_storage" ]; then
+    local cur_target; cur_target="$(readlink "$pub_storage" 2>/dev/null || true)"
+    if [ ! -e "$pub_storage" ] || [[ "$cur_target" == *".new."* ]] || [[ "$cur_target" == *"/tmp/"* ]] || [[ "$cur_target" == *"$STAGE_DIR"* ]]; then
+      rm -f "$pub_storage" 2>/dev/null || true
+    fi
+  fi
+
+  # 4. If artisan is runnable with real framework (not a placeholder shim), invoke artisan storage:link --force
+  if [ -f "$dir/artisan" ] && [ ! -L "$pub_storage" ]; then
+    if [ -f "$dir/vendor/autoload.php" ] && ! grep -q 'WTC Pi Lightweight' "$dir/vendor/autoload.php" 2>/dev/null; then
+      local sname; sname="$(basename "$dir")"
+      [ "$sname" = "webroot" ] && sname="$(active_site 2>/dev/null || echo "")"
+      if [ -n "$sname" ] && valid_name "$sname" 2>/dev/null; then
+        db_write_files "$sname" "$dir" 2>/dev/null || true
+      fi
+      su -s /bin/bash "${WEB_USER:-www-data}" -c "cd '$dir' && php artisan storage:link --force" >> /var/log/wtc-web/service.log 2>&1 || true
+    fi
+  fi
+
+  # 5. Deterministic verification: enforce relative symlink public/storage -> ../storage/app/public
+  # Absolute symlinks are replaced with relative symlinks so archiving and moving never break
+  local link_target; link_target="$(readlink "$pub_storage" 2>/dev/null || true)"
+  if [ ! -L "$pub_storage" ] || [ ! -e "$pub_storage" ] || [[ "$link_target" == /* ]]; then
+    rm -rf "$pub_storage" 2>/dev/null || true
+    ( cd "$pub_dir" && ln -sfn ../storage/app/public storage ) 2>/dev/null || ln -sfn "$storage_pub" "$pub_storage" 2>/dev/null || true
+  fi
+
+  # 6. Ensure appropriate permissions and ownership for web server and php-fpm
+  local u="${WEB_USER:-www-data}"
+  chown -h "$u:$u" "$pub_storage" 2>/dev/null || true
+  chown -R "$u:$u" "$dir/storage" "$dir/bootstrap/cache" 2>/dev/null || true
+  chmod -R 775 "$dir/storage" "$dir/bootstrap/cache" 2>/dev/null || true
+  [ -d "$pub_storage" ] && chmod 775 "$pub_storage" 2>/dev/null || true
+}
+
+# Rebuild Ziggy JS/TS route definitions if the Laravel application uses tightenco/ziggy.
+# Ensures generated route files (e.g. resources/js/ziggy.js) match the current APP_URL and routes.
+rebuild_laravel_ziggy() {
+  local dir="${1:-}" out_target="${2:-/var/log/wtc-web/service.log}"
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  [ -f "$dir/artisan" ] || return 0
+  [ -f "$dir/vendor/autoload.php" ] || return 0
+  ! grep -q 'WTC Pi Lightweight' "$dir/vendor/autoload.php" 2>/dev/null || return 0
+  command -v php >/dev/null 2>&1 || return 0
+
+  local u="${WEB_USER:-www-data}"
+  local has_ziggy=0
+  if [ -d "$dir/vendor/tightenco/ziggy" ]; then
+    has_ziggy=1
+  elif [ -f "$dir/composer.json" ] && grep -qi '"tightenco/ziggy"' "$dir/composer.json" 2>/dev/null; then
+    su -s /bin/bash "$u" -c "cd $(printf '%q' "$dir") && php artisan list --raw" 2>/dev/null | grep -qx 'ziggy:generate' && has_ziggy=1
+  fi
+  [ "$has_ziggy" -eq 1 ] || return 0
+
+  [ -d "$dir/storage" ] && chown -R "$u:$u" "$dir/storage" 2>/dev/null || true
+  [ -d "$dir/bootstrap/cache" ] && chown -R "$u:$u" "$dir/bootstrap/cache" 2>/dev/null || true
+  [ -d "$dir/resources/js" ] && chown -R "$u:$u" "$dir/resources/js" 2>/dev/null || true
+
+  # Clear stale cached config/routes so Ziggy reads current .env APP_URL and routes
+  rm -f "$dir/bootstrap/cache/"*.php 2>/dev/null || true
+
+  local z_out="" z_rc=0 z_ran=0
+  if [ -f "$dir/tsconfig.json" ] || [ -f "$dir/resources/js/ziggy.d.ts" ]; then
+    # Try --types first (Ziggy v2+); fall back to plain ziggy:generate on older versions
+    if z_out="$(su -s /bin/bash "$u" -c "cd $(printf '%q' "$dir") && php artisan ziggy:generate --types" 2>&1)"; then
+      z_ran=1
+      log "Rebuilt Ziggy routes + TypeScript types in '$dir'"
+    fi
+  fi
+
+  if [ "$z_ran" -eq 0 ]; then
+    z_out="$(su -s /bin/bash "$u" -c "cd $(printf '%q' "$dir") && php artisan ziggy:generate" 2>&1)" || z_rc=$?
+    [ "$z_rc" -eq 0 ] && log "Rebuilt Ziggy routes in '$dir'"
+  fi
+
+  if [ -n "$z_out" ]; then
+    if [ "$out_target" = "stdout" ]; then
+      printf '%s\n' "$z_out"
+    else
+      printf '%s\n' "$z_out" >> "$out_target"
+    fi
+  fi
+  return "$z_rc"
+}
+
+# Configure Laravel / PHP application .env for subpath or dedicated port hosting
+# Ensures APP_URL, ASSET_URL, SESSION_COOKIE, and SESSION_PATH align with instance URL and port
+configure_site_env() {
+  local site_dir="$1" slug="$2" port="${3:-}" site_name="${4:-}"
+  [ -n "$site_dir" ] && [ -d "$site_dir" ] || return 0
+  [ -f "$site_dir/.env" ] || return 0
+
+  local host_ip
+  host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [ -n "$host_ip" ] || host_ip="127.0.0.1"
+
+  # Extract host / protocol from existing APP_URL if valid, else fallback to host IP
+  local cur_app_url proto host_base
+  cur_app_url="$(grep -E '^APP_URL=' "$site_dir/.env" 2>/dev/null | cut -d= -f2- | tr -d '"'\'' ' || true)"
+  if [[ "$cur_app_url" =~ ^https?://([^/:]+) ]]; then
+    proto="${cur_app_url%%://*}"
+    host_base="${BASH_REMATCH[1]}"
+  else
+    proto="http"
+    host_base="$host_ip"
+  fi
+  if [ "${FORCE_HTTPS:-no}" = "yes" ]; then
+    proto="https"
+  else
+    proto="http"
+  fi
+
+  local target_app_url target_asset_url target_session_path
+  if [ -n "$port" ] && [ "$port" != "0" ] && [ "$port" != "none" ] && [ "$port" != "null" ]; then
+    target_app_url="${proto}://${host_base}:${port}"
+    target_asset_url=""
+    target_session_path="/"
+  elif [ -n "$slug" ] && [ "$slug" != "root" ] && [ "$slug" != "primary" ]; then
+    target_app_url="${proto}://${host_base}/${slug}"
+    target_asset_url="/${slug}"
+    target_session_path="/${slug}"
+  else
+    target_app_url="${proto}://${host_base}"
+    target_asset_url=""
+    target_session_path="/"
+  fi
+
+  local env_changed=0
+  # 1. Update APP_URL
+  local cur_raw_app_url=""
+  cur_raw_app_url="$(grep -E '^APP_URL=' "$site_dir/.env" 2>/dev/null | head -n1 || true)"
+  if [ "$cur_raw_app_url" != "APP_URL=\"$target_app_url\"" ]; then
+    env_changed=1
+    if grep -q '^APP_URL=' "$site_dir/.env"; then
+      sed -i "s|^APP_URL=.*|APP_URL=\"$target_app_url\"|" "$site_dir/.env" 2>/dev/null || true
+    else
+      echo "APP_URL=\"$target_app_url\"" >> "$site_dir/.env"
+    fi
+  fi
+
+  # 2. Update ASSET_URL
+  local cur_raw_asset_url=""
+  cur_raw_asset_url="$(grep -E '^ASSET_URL=' "$site_dir/.env" 2>/dev/null | head -n1 || true)"
+  if [ -n "$cur_raw_asset_url" ]; then
+    if [ "$cur_raw_asset_url" != "ASSET_URL=\"$target_asset_url\"" ]; then
+      env_changed=1
+      sed -i "s|^ASSET_URL=.*|ASSET_URL=\"$target_asset_url\"|" "$site_dir/.env" 2>/dev/null || true
+    fi
+  elif [ -n "$target_asset_url" ]; then
+    env_changed=1
+    echo "ASSET_URL=\"$target_asset_url\"" >> "$site_dir/.env"
+  fi
+
+  # 3. Update SESSION_COOKIE to avoid session collision between concurrent instances
+  local sess_cookie="w_${slug:-root}_session"
+  local cur_raw_sc=""
+  cur_raw_sc="$(grep -E '^SESSION_COOKIE=' "$site_dir/.env" 2>/dev/null | head -n1 || true)"
+  if [ "$cur_raw_sc" != "SESSION_COOKIE=\"$sess_cookie\"" ]; then
+    env_changed=1
+    if grep -q '^SESSION_COOKIE=' "$site_dir/.env"; then
+      sed -i "s|^SESSION_COOKIE=.*|SESSION_COOKIE=\"$sess_cookie\"|" "$site_dir/.env" 2>/dev/null || true
+    else
+      echo "SESSION_COOKIE=\"$sess_cookie\"" >> "$site_dir/.env"
+    fi
+  fi
+
+  # 4. Update SESSION_PATH
+  local cur_raw_sp=""
+  cur_raw_sp="$(grep -E '^SESSION_PATH=' "$site_dir/.env" 2>/dev/null | head -n1 || true)"
+  if [ "$cur_raw_sp" != "SESSION_PATH=\"$target_session_path\"" ]; then
+    env_changed=1
+    if grep -q '^SESSION_PATH=' "$site_dir/.env"; then
+      sed -i "s|^SESSION_PATH=.*|SESSION_PATH=\"$target_session_path\"|" "$site_dir/.env" 2>/dev/null || true
+    else
+      echo "SESSION_PATH=\"$target_session_path\"" >> "$site_dir/.env"
+    fi
+  fi
+
+  # 5. Update APP_NAME if provided
+  if [ -n "$site_name" ]; then
+    local cur_raw_an=""
+    cur_raw_an="$(grep -E '^APP_NAME=' "$site_dir/.env" 2>/dev/null | head -n1 || true)"
+    if [ -n "$cur_raw_an" ] && [ "$cur_raw_an" != "APP_NAME=\"$site_name\"" ]; then
+      env_changed=1
+      sed -i "s|^APP_NAME=.*|APP_NAME=\"$site_name\"|" "$site_dir/.env" 2>/dev/null || true
+    fi
+  fi
+
+  # 6. Clear Laravel configuration caches and rebuild Ziggy routes when .env changed
+  if [ "$env_changed" -eq 1 ] && [ -f "$site_dir/artisan" ] && [ -f "$site_dir/vendor/autoload.php" ]; then
+    local u="${WEB_USER:-www-data}"
+    su -s /bin/bash "$u" -c "cd '$site_dir' && php artisan config:clear" >> /var/log/wtc-web/service.log 2>&1 || true
+    su -s /bin/bash "$u" -c "cd '$site_dir' && php artisan route:clear" >> /var/log/wtc-web/service.log 2>&1 || true
+    rebuild_laravel_ziggy "$site_dir" || true
+  fi
+}
+
+# Save current SITES_DIR/<name>.tar.gz as a timestamped rollback snapshot in PREV_DIR/<name>/.
+# Prunes oldest snapshots if ROLLBACK_KEEP > 0.
+save_site_rollback() {
+  local name="$1"
+  local src="$SITES_DIR/$name.tar.gz"
+  [ -f "$src" ] || return 0
+  local rdir="$PREV_DIR/$name"
+  mkdir -p "$rdir"
+  local ts; ts="$(date '+%Y%m%d-%H%M%S')"
+  local dest="$rdir/${ts}.tar.gz"
+  local n=1
+  while [ -e "$dest" ]; do
+    dest="$rdir/${ts}-${n}.tar.gz"
+    n=$((n + 1))
+  done
+  cp -f "$src" "$dest" 2>/dev/null || return 1
+  chmod 0644 "$dest" 2>/dev/null || true
+
+  local keep="${ROLLBACK_KEEP:-5}"
+  if [[ "$keep" =~ ^[0-9]+$ ]] && [ "$keep" -gt 0 ]; then
+    local count=0 f
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      count=$((count + 1))
+      if [ "$count" -gt "$keep" ]; then
+        rm -f "$f" 2>/dev/null || true
+      fi
+    done < <(ls -1t "$rdir"/*.tar.gz 2>/dev/null || true)
+  fi
+}
+
+# Write/update SITES_DIR/<name>.meta.json atomically from <dir> while preserving assigned port.
+write_site_meta() {
+  local name="$1" dir="$2"
+  local meta_f="$SITES_DIR/$name.meta.json"
+  local stack="unknown" hasBuild="false" cur_port="null"
+  if [ -d "$dir" ]; then
+    stack="$(detect_site_stack "$dir")"
+    [ -f "$dir/package.json" ] && hasBuild="true"
+  fi
+  if [ -f "$meta_f" ] && command -v jq >/dev/null 2>&1; then
+    cur_port="$(jq -r '.port // null' "$meta_f" 2>/dev/null || echo null)"
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    if [ -n "$cur_port" ] && [ "$cur_port" != "null" ]; then
+      jq -nc --arg st "$stack" --argjson hb "$hasBuild" --argjson m "$(date +%s)" --argjson pt "$cur_port" \
+        '{stack:$st, hasBuild:$hb, mtime:$m, port:$pt}' > "$meta_f.tmp" && mv -f "$meta_f.tmp" "$meta_f"
+    else
+      jq -nc --arg st "$stack" --argjson hb "$hasBuild" --argjson m "$(date +%s)" \
+        '{stack:$st, hasBuild:$hb, mtime:$m}' > "$meta_f.tmp" && mv -f "$meta_f.tmp" "$meta_f"
+    fi
+  else
+    cat > "$meta_f.tmp" <<EOF
+{"stack":"$stack","hasBuild":$hasBuild,"mtime":$(date +%s)}
+EOF
+    mv -f "$meta_f.tmp" "$meta_f"
+  fi
+  chmod 0644 "$meta_f" 2>/dev/null || true
+}
+
+# Pack <dir> into SITES_DIR/<name>.tar.gz atomically, saving a timestamped rollback snapshot.
 # Also writes cached metadata in SITES_DIR/<name>.meta.json for instant UI listing.
 # Sets EXISTED=1 if the site already existed.
 store_dir_as_site() {
   local name="$1" dir="$2" out
   mkdir -p "$SITES_DIR" "$PREV_DIR"
+  ensure_laravel_storage_link "$dir"
   preserve_existing_site_configs "$name" "$dir"
   out="$(mktemp "$SITES_DIR/.new.XXXXXX")"
-  if ! tar -czf "$out" -C "$dir" .; then rm -f "$out"; return 1; fi
+  local -a tar_cmd=(tar -czf)
+  if command -v pigz >/dev/null 2>&1; then
+    tar_cmd=(tar --use-compress-program=pigz -cf)
+  fi
+  if ! "${tar_cmd[@]}" "$out" -C "$dir" .; then rm -f "$out"; return 1; fi
   EXISTED=0
   if [ -f "$SITES_DIR/$name.tar.gz" ]; then
     EXISTED=1
-    cp -f "$SITES_DIR/$name.tar.gz" "$PREV_DIR/$name.tar.gz"
+    save_site_rollback "$name"
   fi
   chmod 0644 "$out"
   mv -f "$out" "$SITES_DIR/$name.tar.gz"
 
-  # Fast metadata generation directly from $dir without needing tar -tf later
-  local stack="unknown" hasBuild="false"
-  if [ -d "$dir" ]; then
-    stack="$(detect_site_stack "$dir")"
-    [ -f "$dir/package.json" ] && hasBuild="true"
-  fi
-  cat > "$SITES_DIR/$name.meta.json" <<EOF
-{"stack":"$stack","hasBuild":$hasBuild,"mtime":$(date +%s)}
-EOF
-  chmod 0644 "$SITES_DIR/$name.meta.json" 2>/dev/null || true
+  write_site_meta "$name" "$dir"
   sync
 }
 
@@ -569,14 +965,17 @@ EOF
     chown "$WEB_USER:$WEB_USER" "$rel/.wtc-db.php"
     chmod 0640 "$rel/.wtc-db.php"
 
-    # Sync into Laravel / standard .env if present
+    # Sync into Laravel / standard .env if present (upsert even if commented out or missing)
     if [ -f "$rel/.env" ]; then
-      sed -i "s|^DB_CONNECTION=.*|DB_CONNECTION=mysql|" "$rel/.env" 2>/dev/null || true
-      sed -i "s|^DB_HOST=.*|DB_HOST=$DB_HOST|" "$rel/.env" 2>/dev/null || true
-      sed -i "s|^DB_PORT=.*|DB_PORT=$DB_PORT|" "$rel/.env" 2>/dev/null || true
-      sed -i "s|^DB_DATABASE=.*|DB_DATABASE=$DB_NAME|" "$rel/.env" 2>/dev/null || true
-      sed -i "s|^DB_USERNAME=.*|DB_USERNAME=$DB_USER|" "$rel/.env" 2>/dev/null || true
-      sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=$DB_PASS|" "$rel/.env" 2>/dev/null || true
+      local ek ev
+      for ek in "DB_CONNECTION=mysql" "DB_HOST=$DB_HOST" "DB_PORT=$DB_PORT" "DB_DATABASE=$DB_NAME" "DB_USERNAME=$DB_USER" "DB_PASSWORD=$DB_PASS"; do
+        ev="${ek#*=}"; ek="${ek%%=*}"
+        if grep -qE "^#?[[:space:]]*${ek}=" "$rel/.env" 2>/dev/null; then
+          sed -i "s|^#*[[:space:]]*${ek}=.*|${ek}=${ev}|" "$rel/.env" 2>/dev/null || true
+        else
+          echo "${ek}=${ev}" >> "$rel/.env"
+        fi
+      done
       # Generate APP_KEY if empty in .env
       if grep -qE '^APP_KEY=\s*$' "$rel/.env" 2>/dev/null || ! grep -q 'APP_KEY=' "$rel/.env" 2>/dev/null; then
         local kgen
@@ -825,12 +1224,32 @@ EOF
 # Generate dedicated Port 80 location blocks for multi-site concurrent hosting at /<slug>/
 generate_site_nginx_block() {
   local site="$1" slug="$2" site_dir="$3" webroot="$4" out="$5"
+  local slug_var="${slug//-/_}"
   mkdir -p "$(dirname "$out")"
 
   cat > "$out" <<EOF
 # WTC Managed Multi-Site: $site (slug: $slug)
 location = /$slug {
     return 301 /$slug/;
+}
+
+# Auto-rewrite for $slug:
+# If a request (form submission, XHR, relative asset, or redirect follow) originated from
+# this instance (identified by Referer: .../$slug/...) but lost the /$slug prefix
+# (e.g. form action="/login", a href="/login", redirect to / or /dashboard),
+# rewrite it back into /$slug/ so the request stays within this system.
+set \$wtc_sub_${slug_var} "";
+if (\$http_referer ~* ^https?://[^/]+/$slug(?:/|$)) {
+    set \$wtc_sub_${slug_var} "R";
+}
+if (\$uri ~* ^/$slug(?:/|$)) {
+    set \$wtc_sub_${slug_var} "";
+}
+if (\$uri ~* ^/(?:manage|api/wtc)) {
+    set \$wtc_sub_${slug_var} "";
+}
+if (\$wtc_sub_${slug_var} = "R") {
+    rewrite ^/(.*)\$ /$slug/\$1 last;
 }
 
 location ^~ /$slug/ {
@@ -856,11 +1275,12 @@ location ^~ /$slug/ {
     default_type application/octet-stream;
 
     # Inject base href so client-side SPA routers and relative assets resolve to /$slug/
-    sub_filter_once on;
+    sub_filter_once off;
     sub_filter_types text/html;
+    sub_filter '<base href="/"' '<base href="/$slug/"';
+    sub_filter '<base href=""' '<base href="/$slug/"';
     sub_filter '<head>' '<head><base href="/$slug/">';
     sub_filter '<HEAD>' '<HEAD><base href="/$slug/">';
-    sub_filter '<base href="/"' '<base href="/$slug/"';
 
     # 1. Dedicated prefix blocks for Vite build assets and Laravel public storage
     location ^~ /$slug/build/ {
@@ -923,6 +1343,7 @@ location ^~ /$slug/ {
         fastcgi_param SCRIPT_NAME /$slug/\$fastcgi_script_name;
         fastcgi_param PATH_INFO \$fastcgi_path_info;
         fastcgi_param DOCUMENT_ROOT $webroot;
+        fastcgi_param REQUEST_URI \$document_uri\$is_args\$args;
         fastcgi_param HTTP_X_FORWARDED_PREFIX /$slug;
         fastcgi_param HTTP_X_FORWARDED_PROTO \$scheme;
         fastcgi_param HTTP_X_FORWARDED_HOST \$http_host;
@@ -945,7 +1366,7 @@ location @${slug}_fcgi {
     fastcgi_param SCRIPT_FILENAME $webroot/index.php;
     fastcgi_param SCRIPT_NAME /$slug/index.php;
     fastcgi_param DOCUMENT_ROOT $webroot;
-    fastcgi_param REQUEST_URI \$request_uri;
+    fastcgi_param REQUEST_URI \$document_uri\$is_args\$args;
     fastcgi_param QUERY_STRING \$query_string;
     fastcgi_param HTTP_X_FORWARDED_PREFIX /$slug;
     fastcgi_param HTTP_X_FORWARDED_PROTO \$scheme;
@@ -956,6 +1377,114 @@ location @${slug}_fcgi {
 }
 EOF
   chmod 0644 "$out"
+}
+
+# Sync /etc/nginx/wtc-force-https.conf with FORCE_HTTPS (yes|no) and ensure
+# /etc/nginx/sites-available/wtc has port 443 SSL + include directive when enabled.
+sync_force_https_conf() {
+  local conf="/etc/nginx/wtc-force-https.conf"
+  local crt="/etc/ssl/wtc-ui/wtc-ui.crt"
+  local key="/etc/ssl/wtc-ui/wtc-ui.key"
+  local vhost="/etc/nginx/sites-available/wtc"
+  mkdir -p /etc/nginx
+
+  if [ "${FORCE_HTTPS:-no}" = "yes" ] && [ -f "$crt" ] && [ -f "$key" ]; then
+    cat > "$conf" <<'EOF'
+if ($scheme = http) {
+    return 302 https://$host$request_uri;
+}
+EOF
+    if [ -f "$vhost" ] && ! grep -q "listen 443 ssl" "$vhost"; then
+      sed -i '/listen \[::\]:8080;/a \    listen 443 ssl default_server;\n    listen [::]:443 ssl default_server;\n    ssl_certificate /etc/ssl/wtc-ui/wtc-ui.crt;\n    ssl_certificate_key /etc/ssl/wtc-ui/wtc-ui.key;\n    ssl_protocols TLSv1.2 TLSv1.3;' "$vhost" 2>/dev/null || true
+    fi
+    if [ -f "$vhost" ] && ! grep -q "wtc-force-https.conf" "$vhost"; then
+      sed -i '/server_name _;/a \    include /etc/nginx/wtc-force-https.conf;' "$vhost" 2>/dev/null || true
+    fi
+  else
+    cat > "$conf" <<'EOF'
+# Force HTTPS disabled
+EOF
+  fi
+  chmod 0644 "$conf" 2>/dev/null || true
+}
+
+# Generate dedicated port vhost config for a site (HTTP or HTTPS when FORCE_HTTPS=yes).
+generate_site_port_nginx_conf() {
+  local site="$1" slug="$2" port="$3" webroot="$4" out="$5"
+  local crt="/etc/ssl/wtc-ui/wtc-ui.crt"
+  local key="/etc/ssl/wtc-ui/wtc-ui.key"
+  mkdir -p "$(dirname "$out")"
+
+  if [ "${FORCE_HTTPS:-no}" = "yes" ] && [ -f "$crt" ] && [ -f "$key" ]; then
+    cat > "$out" <<EOF
+server {
+    listen $port ssl;
+    listen [::]:$port ssl;
+    ssl_certificate $crt;
+    ssl_certificate_key $key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    error_page 497 =302 https://\$host:\$server_port\$request_uri;
+    server_name _;
+    root $webroot;
+    index index.php index.html index.htm;
+
+    client_max_body_size 10240m;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ^~ /storage/ {
+        root $webroot;
+        access_log off;
+        expires 30d;
+    }
+
+    location ~ \.php$ {
+        try_files \$uri =404;
+        include fastcgi_params;
+        fastcgi_pass unix:/run/php/wtc-site.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+
+    location ~ /\. { deny all; }
+}
+EOF
+  else
+    cat > "$out" <<EOF
+server {
+    listen $port;
+    listen [::]:$port;
+    server_name _;
+    root $webroot;
+    index index.php index.html index.htm;
+
+    client_max_body_size 10240m;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ^~ /storage/ {
+        root $webroot;
+        access_log off;
+        expires 30d;
+    }
+
+    location ~ \.php$ {
+        try_files \$uri =404;
+        include fastcgi_params;
+        fastcgi_pass unix:/run/php/wtc-site.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+
+    location ~ /\. { deny all; }
+}
+EOF
+  fi
+  chmod 0644 "$out" 2>/dev/null || true
 }
 
 

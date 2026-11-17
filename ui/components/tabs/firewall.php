@@ -53,6 +53,7 @@ foreach ($rules as $r) {
 // Preset common Raspberry Pi services for 1-click toggling
 $commonServices = [
     ['name' => 'HTTP Web Server', 'port' => '80', 'proto' => 'tcp', 'icon' => '🌐', 'desc' => 'Port 80 (Site /site/ & UI Root)'],
+    ['name' => 'HTTPS Web Server', 'port' => '443', 'proto' => 'tcp', 'icon' => '🔐', 'desc' => 'Port 443 (HTTPS Live Sites)'],
     ['name' => 'Site Direct Root', 'port' => '8080', 'proto' => 'tcp', 'icon' => '🚀', 'desc' => 'Port 8080 (Native root application)'],
     ['name' => 'WTC Management UI', 'port' => '4485', 'proto' => 'tcp', 'icon' => '🛠️', 'desc' => 'Port 4485 (Dedicated LAN UI)', 'locked' => true],
     ['name' => 'SSH Server', 'port' => '22', 'proto' => 'tcp', 'icon' => '🔒', 'desc' => 'Port 22 (Remote Shell & SFTP)', 'locked' => true],
@@ -85,7 +86,7 @@ $commonServices = [
                 <?= form('firewall', ['do' => 'install'], '📦 Install UFW Firewall', 'btn-pri', 'Install UFW packet filter on the Raspberry Pi?') ?>
             <?php elseif ($active): ?>
                 <?= form('firewall', ['do' => 'disable'], '🛑 Disable Firewall', 'btn-ctrl danger', 'Disable the firewall? All system ports will be accessible on the network.') ?>
-                <?= form('firewall', ['do' => 'reset'], '🔄 Reset Rules', 'btn-ctrl', 'Reset firewall rules to safe default (Allow 22, 80, 8080, 4485)?') ?>
+                <?= form('firewall', ['do' => 'reset'], '🔄 Reset Rules', 'btn-ctrl', 'Reset firewall rules to safe default (Allow 22, 80, 443, 8080, 4485, 4486)?') ?>
             <?php else: ?>
                 <?= form('firewall', ['do' => 'enable'], '▶️ Enable Firewall', 'btn-pri', 'Enable UFW firewall? Unopened ports will be blocked from external access.') ?>
             <?php endif; ?>
